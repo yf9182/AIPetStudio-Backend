@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local testing. Never commit real values.
+JWT_SECRET=replace-with-a-long-random-secret
+REVENUECAT_SECRET_KEY=replace-with-revenuecat-v2-secret
+VIDU_API_KEY=replace-with-vidu-api-key

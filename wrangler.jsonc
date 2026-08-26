@@ -1,0 +1,49 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "ai-pet-studio-backend",
+  "main": "src/index.ts",
+  "workers_dev": true,
+  "preview_urls": false,
+  "compatibility_date": "2026-08-19",
+  "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
+  "workflows": [
+    {
+      "name": "ai-pet-studio-video-task",
+      "binding": "VIDEO_TASK_WORKFLOW",
+      "class_name": "VideoTaskWorkflow"
+    }
+  ],
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "ai-pet-studio-db",
+      "database_id": "9c96d42a-6c56-4b4e-bbf3-e51c2ec368f0",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "ASSETS",
+      "bucket_name": "ai-pet-studio-assets"
+    }
+  ],
+  "triggers": {
+    "crons": ["*/10 * * * *"]
+  },
+  "vars": {
+    "APP_NAME": "AI Pet Studio",
+    "APP_ATTEST_MODE": "disabled",
+    "APP_CHECK_PROJECT_NUMBER": "308903341376",
+    "APP_CHECK_APP_ID": "1:308903341376:ios:58e71edbc19aa654671ea5",
+    "REVENUECAT_PROJECT_ID": "projbb3ee948",
+    "REVENUECAT_VIRTUAL_CURRENCY_CODE": "PTS",
+    "REVENUECAT_API_BASE_URL": "https://api.revenuecat.com",
+    "ACCESS_TOKEN_TTL_SECONDS": "3600",
+    "DOWNLOAD_URL_TTL_SECONDS": "900",
+    "VIDU_BASE_URL": "https://api.vidu.com",
+    "VIDU_IMAGE_MODEL": "viduq2",
+    "VIDU_VIDEO_MODEL": "viduq3-pro-fast",
+    "CORS_ORIGINS": ""
+  },
+  "observability": { "enabled": true }
+}
