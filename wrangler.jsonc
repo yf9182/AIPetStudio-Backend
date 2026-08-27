@@ -6,13 +6,6 @@
   "preview_urls": false,
   "compatibility_date": "2026-08-19",
   "compatibility_flags": ["nodejs_compat", "global_fetch_strictly_public"],
-  "workflows": [
-    {
-      "name": "ai-pet-studio-video-task",
-      "binding": "VIDEO_TASK_WORKFLOW",
-      "class_name": "VideoTaskWorkflow"
-    }
-  ],
   "d1_databases": [
     {
       "binding": "DB",

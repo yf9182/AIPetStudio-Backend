@@ -18,12 +18,9 @@ export interface Env {
   VIDU_BASE_URL?: string;
   VIDU_IMAGE_MODEL?: string;
   VIDU_VIDEO_MODEL?: string;
-  VIDEO_TASK_WORKFLOW?: Workflow<{ taskID: string }>;
 }
 
-export { VideoTaskWorkflow } from "./workflow";
-
-type User = { id: string; customer_id: string; device_id: string };
+type User = { id: string; customer_id: string; device_id: string; welcome_bonus_granted_at?: string | null };
 type MaterialSnapshot = {
   material_id: string;
   title: string;
@@ -34,6 +31,21 @@ type MaterialSnapshot = {
 };
 
 const GENERATION_COSTS = { image: 10, video: 50 } as const;
+
+type RevenueCatBalance = { currency_code?: string; balance?: number };
+type RevenueCatResponse = { items?: unknown; type?: unknown; message?: unknown };
+
+class RevenueCatRequestError extends Error {
+  readonly status: number;
+  readonly providerMessage: string | null;
+
+  constructor(status: number, providerMessage: string | null) {
+    super(`RevenueCat request failed (${status})`);
+    this.name = "RevenueCatRequestError";
+    this.status = status;
+    this.providerMessage = providerMessage;
+  }
+}
 
 function now(): string { return new Date().toISOString(); }
 function id(): string { return crypto.randomUUID(); }
@@ -161,15 +173,14 @@ async function userForRequest(request: Request, env: Env): Promise<User | null> 
   const token = value.startsWith("Bearer ") ? value.slice(7) : "";
   const claims = token ? await verifyToken(env, token) : null;
   if (!claims) return null;
-  return await env.DB.prepare("SELECT id, customer_id, device_id FROM users WHERE id = ? AND deleted_at IS NULL").bind(claims.sub).first<User>();
+  return await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE id = ? AND deleted_at IS NULL").bind(claims.sub).first<User>();
 }
 async function ensureUser(env: Env, deviceID: string): Promise<User> {
   const customerID = `aipet_${deviceID}`;
-  const existing = await env.DB.prepare("SELECT id, customer_id, device_id FROM users WHERE customer_id = ?").bind(customerID).first<User>();
+  const existing = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE customer_id = ?").bind(customerID).first<User>();
   if (existing) return existing;
-  const user: User = { id: id(), customer_id: customerID, device_id: deviceID };
+  const user: User = { id: id(), customer_id: customerID, device_id: deviceID, welcome_bonus_granted_at: null };
   await env.DB.prepare("INSERT INTO users(id, customer_id, device_id, created_at, updated_at) VALUES(?, ?, ?, ?, ?)").bind(user.id, user.customer_id, user.device_id, now(), now()).run();
-  await grantPoints(env, user, 20, "signup", `signup:${user.id}`);
   return user;
 }
 async function revenueCatAdjust(env: Env, customerID: string, amount: number, reference: string): Promise<number | null> {
@@ -188,21 +199,37 @@ async function revenueCatAdjust(env: Env, customerID: string, amount: number, re
   // the client SDK is configured. Keep the local ledger authoritative for
   // that onboarding window; later purchases are reconciled by webhook.
   if (response.status === 404) return null;
-  if (!response.ok) throw new Error(`RevenueCat request failed (${response.status})`);
-  const body = await response.json() as { items?: Array<{ currency_code?: string; balance?: number }> };
-  return body.items?.find(item => item.currency_code === env.REVENUECAT_VIRTUAL_CURRENCY_CODE)?.balance ?? null;
+  const rawBody = await response.text();
+  let body: RevenueCatResponse = {};
+  try { body = rawBody ? JSON.parse(rawBody) as RevenueCatResponse : {}; } catch { /* handled below */ }
+  const providerMessage = typeof body.message === "string" ? body.message : null;
+  if (!response.ok) {
+    console.error("RevenueCat adjustment failed", {
+      status: response.status,
+      type: typeof body.type === "string" ? body.type : null,
+      message: providerMessage
+    });
+    throw new RevenueCatRequestError(response.status, providerMessage);
+  }
+  if (!Array.isArray(body.items)) {
+    console.error("RevenueCat adjustment returned an unexpected response", { status: response.status });
+    throw new Error("RevenueCat adjustment response is invalid");
+  }
+  return (body.items as RevenueCatBalance[])
+    .find(item => item.currency_code === env.REVENUECAT_VIRTUAL_CURRENCY_CODE)?.balance ?? null;
 }
 async function grantPoints(env: Env, user: User, amount: number, reason: string, reference: string): Promise<number> {
   const already = await env.DB.prepare("SELECT id FROM credit_ledger WHERE reference = ?").bind(reference).first<{ id: string }>();
   if (!already) {
-    if (env.REVENUECAT_SECRET_KEY) await revenueCatAdjust(env, user.customer_id, amount, reference);
+    const providerBalance = await revenueCatAdjust(env, user.customer_id, amount, reference);
+    if (providerBalance === null) return 0;
     await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)").bind(id(), user.id, user.customer_id, amount, reason, reference, now()).run();
   }
-  return await localLedgerBalance(env, user);
+  return await getPoints(env, user);
 }
 async function debitPoints(env: Env, user: User, amount: number, reference: string): Promise<number> {
   const already = await env.DB.prepare("SELECT id FROM credit_ledger WHERE reference = ?").bind(reference).first<{ id: string }>();
-  if (already) return localLedgerBalance(env, user);
+  if (already) return getPoints(env, user);
   const current = await getPoints(env, user);
   if (current < amount) throw new Error("INSUFFICIENT_POINTS");
   if (env.REVENUECAT_SECRET_KEY) await revenueCatAdjust(env, user.customer_id, -amount, reference);
@@ -212,22 +239,54 @@ async function debitPoints(env: Env, user: User, amount: number, reference: stri
 async function refundPoints(env: Env, user: User, amount: number, reference: string): Promise<number> {
   return await grantPoints(env, user, amount, "generation_refund", reference);
 }
-async function localLedgerBalance(env: Env, user: User): Promise<number> {
-  const row = await env.DB.prepare("SELECT COALESCE(SUM(amount), 0) AS balance FROM credit_ledger WHERE user_id = ?").bind(user.id).first<{ balance: number }>();
-  return Number(row?.balance || 0);
+async function syncSignupPointsToRevenueCat(env: Env, user: User): Promise<boolean> {
+  if (!env.REVENUECAT_SECRET_KEY) return false;
+  if (user.welcome_bonus_granted_at) return false;
+  const amount = 20;
+  const reference = `signup:${user.id}`;
+  // The first bootstrap can happen before the RevenueCat SDK creates this
+  // customer. Reusing the signup reference makes the later retry idempotent.
+  const providerBalance = await revenueCatAdjust(env, user.customer_id, amount, reference);
+  if (providerBalance === null) return false;
+  const grantedAt = now();
+  await env.DB.prepare("UPDATE users SET welcome_bonus_granted_at = ?, updated_at = ? WHERE id = ? AND welcome_bonus_granted_at IS NULL")
+    .bind(grantedAt, grantedAt, user.id).run();
+  await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
+    .bind(id(), user.id, user.customer_id, amount, "signup", reference, grantedAt).run();
+  return true;
+}
+type PointsRead = { balance: number; welcomeBonusGranted: boolean };
+async function revenueCatBalance(env: Env, user: User): Promise<number | null> {
+  const response = await fetch(`${env.REVENUECAT_API_BASE_URL}/v2/projects/${encodeURIComponent(env.REVENUECAT_PROJECT_ID)}/customers/${encodeURIComponent(user.customer_id)}/virtual_currencies`, {
+    headers: { Authorization: `Bearer ${env.REVENUECAT_SECRET_KEY}` }
+  });
+  if (response.status === 404) return null;
+  const rawBody = await response.text();
+  let body: RevenueCatResponse = {};
+  try { body = rawBody ? JSON.parse(rawBody) as RevenueCatResponse : {}; } catch { /* handled below */ }
+  const providerMessage = typeof body.message === "string" ? body.message : null;
+  if (!response.ok) {
+    console.error("RevenueCat balance request failed", {
+      status: response.status,
+      type: typeof body.type === "string" ? body.type : null,
+      message: providerMessage
+    });
+    throw new RevenueCatRequestError(response.status, providerMessage);
+  }
+  if (!Array.isArray(body.items)) {
+    console.error("RevenueCat balance returned an unexpected response", { status: response.status });
+    throw new Error("RevenueCat balance response is invalid");
+  }
+  const item = (body.items as RevenueCatBalance[]).find(entry => entry.currency_code === env.REVENUECAT_VIRTUAL_CURRENCY_CODE);
+  return typeof item?.balance === "number" ? item.balance : 0;
+}
+async function readPoints(env: Env, user: User): Promise<PointsRead> {
+  if (!env.REVENUECAT_SECRET_KEY) return { balance: 0, welcomeBonusGranted: false };
+  const welcomeBonusGranted = await syncSignupPointsToRevenueCat(env, user);
+  return { balance: await revenueCatBalance(env, user) ?? 0, welcomeBonusGranted };
 }
 async function getPoints(env: Env, user: User): Promise<number> {
-  if (env.REVENUECAT_SECRET_KEY) {
-    try {
-      const response = await fetch(`${env.REVENUECAT_API_BASE_URL}/v2/projects/${encodeURIComponent(env.REVENUECAT_PROJECT_ID)}/customers/${encodeURIComponent(user.customer_id)}/virtual_currencies`, { headers: { Authorization: `Bearer ${env.REVENUECAT_SECRET_KEY}` } });
-      if (response.ok) {
-        const body = await response.json() as { items?: Array<{ currency_code?: string; balance?: number }> };
-        const item = body.items?.find(entry => entry.currency_code === env.REVENUECAT_VIRTUAL_CURRENCY_CODE);
-        if (typeof item?.balance === "number") return item.balance;
-      }
-    } catch (cause) { console.error("RevenueCat balance failed", cause); }
-  }
-  return localLedgerBalance(env, user);
+  return (await readPoints(env, user)).balance;
 }
 async function getEntitlement(env: Env, user: User): Promise<string | null> {
   if (!env.REVENUECAT_SECRET_KEY) return null;
@@ -268,14 +327,16 @@ function parseMaterialSnapshot(value: unknown, templateID: string | null): Mater
   const title = body.title === undefined || body.title === null ? "" : String(body.title).trim();
   if (title.length > 500) return null;
   if (body.kind !== "image" && body.kind !== "video") return null;
-  if (typeof body.prompt !== "string" || body.prompt.trim().length < 1 || body.prompt.length > 20_000) return null;
   if (typeof body.image_count !== "number" || !Number.isSafeInteger(body.image_count) || body.image_count !== 1) return null;
+  const prompt = typeof body.prompt === "string" ? body.prompt : "";
+  const maxPromptLength = body.kind === "image" ? 2_000 : 5_000;
+  if (prompt.trim().length < 1 || prompt.length > maxPromptLength) return null;
   if (body.source_updated_at !== undefined && body.source_updated_at !== null && typeof body.source_updated_at !== "string") return null;
   return {
     material_id: materialID,
     title,
     kind: body.kind,
-    prompt: body.prompt,
+    prompt,
     image_count: body.image_count,
     source_updated_at: body.source_updated_at === undefined || body.source_updated_at === null ? null : body.source_updated_at
   };
@@ -405,7 +466,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const token = String(body.refresh_token || "");
     const claims = await verifyToken(env, token);
     if (!claims) return error("Refresh token is invalid", 401, "UNAUTHORIZED");
-    const user = await env.DB.prepare("SELECT id, customer_id, device_id FROM users WHERE id = ? AND deleted_at IS NULL").bind(claims.sub).first<User>();
+    const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE id = ? AND deleted_at IS NULL").bind(claims.sub).first<User>();
     if (!user) return error("User not found", 401, "UNAUTHORIZED");
     const refreshed = await issueToken(env, user);
     return json({ access_token: refreshed, refresh_token: refreshed, customer_id: user.customer_id, expires_in: Number(env.ACCESS_TOKEN_TTL_SECONDS || 3600) }, { headers: corsHeaders(env) });
@@ -422,13 +483,24 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     return json({ ok: true }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/wallet" && request.method === "GET") {
-    const balance = await getPoints(env, user);
+    let points: PointsRead;
+    try { points = await readPoints(env, user); }
+    catch (cause) {
+      if (cause instanceof RevenueCatRequestError) return error("Points service is temporarily unavailable", 503, "POINTS_PROVIDER_ERROR");
+      throw cause;
+    }
     const entitlement = await getEntitlement(env, user);
     const transactions = await env.DB.prepare(`
       SELECT id, amount, reason, reference, created_at
       FROM credit_ledger WHERE user_id = ? ORDER BY created_at DESC LIMIT 50
     `).bind(user.id).all<Record<string, unknown>>();
-    return json({ balance, entitlement, transactions: transactions.results || [] }, { headers: corsHeaders(env) });
+    return json({
+      balance: points.balance,
+      entitlement,
+      welcome_bonus_granted: points.welcomeBonusGranted,
+      welcome_bonus_points: points.welcomeBonusGranted ? 20 : 0,
+      transactions: transactions.results || []
+    }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/wallet/transactions" && request.method === "GET") {
     const transactions = await env.DB.prepare(`
@@ -438,7 +510,19 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     return json({ items: transactions.results || [] }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/wallet/reconcile" && request.method === "POST") {
-    return json({ balance: await getPoints(env, user), entitlement: await getEntitlement(env, user) }, { headers: corsHeaders(env) });
+    let points: PointsRead;
+    try { points = await readPoints(env, user); }
+    catch (cause) {
+      if (cause instanceof RevenueCatRequestError) return error("Points service is temporarily unavailable", 503, "POINTS_PROVIDER_ERROR");
+      throw cause;
+    }
+    return json({
+      balance: points.balance,
+      entitlement: await getEntitlement(env, user),
+      welcome_bonus_granted: points.welcomeBonusGranted,
+      welcome_bonus_points: points.welcomeBonusGranted ? 20 : 0,
+      transactions: []
+    }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/uploads/images" && request.method === "POST") {
     const form = await request.formData();
@@ -547,7 +631,16 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     const debitKey = `task:${taskID}:debit`;
     const generationCost = GENERATION_COSTS[snapshot.kind];
     try { await debitPoints(env, user, generationCost, debitKey); }
-    catch (cause) { if (cause instanceof Error && cause.message === "INSUFFICIENT_POINTS") return error("Not enough PTS", 402, "INSUFFICIENT_POINTS"); throw cause; }
+    catch (cause) {
+      if (cause instanceof Error && cause.message === "INSUFFICIENT_POINTS") return error("Not enough PTS", 402, "INSUFFICIENT_POINTS");
+      if (cause instanceof RevenueCatRequestError) {
+        if (cause.status === 422 && /balance|enough|insufficient/i.test(cause.providerMessage || "")) {
+          return error("Not enough PTS", 402, "INSUFFICIENT_POINTS");
+        }
+        return error("Points service is temporarily unavailable", 503, "POINTS_PROVIDER_ERROR");
+      }
+      throw cause;
+    }
     const templateTitle = snapshot.title || templateID || "自定义任务";
     await env.DB.prepare(`
       INSERT INTO tasks(id, user_id, template_id, template_title, kind, state, points, debit_key, input_json, material_snapshot_json, progress, retry_count, client_request_id, created_at, updated_at)
@@ -558,9 +651,14 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       await env.DB.prepare("UPDATE tasks SET state = 'failed', error_code = 'VIDU_NOT_CONFIGURED', error_message = ?, updated_at = ? WHERE id = ?")
         .bind("Vidu provider is not configured", now(), taskID).run();
     } else {
-      ctx.waitUntil(submitVidu(env, taskID, snapshot, assetIDs, user));
+      // 创建时只做一次同步转发；后续进度由 App 轮询详情接口推进。
+      await submitVidu(env, taskID, snapshot, assetIDs, user);
     }
-    return json({ id: taskID, state: "queued", kind: snapshot.kind, points: generationCost, progress: 0, artwork_id: null }, { status: 201, headers: corsHeaders(env) });
+    const createdTask = await env.DB.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").bind(taskID, user.id).first<Record<string, any>>();
+    return json(taskResponse(request, createdTask || {
+      id: taskID, state: "queued", kind: snapshot.kind, points: generationCost, progress: 0,
+      artwork_id: null, input_json: JSON.stringify(assetIDs)
+    }), { status: 201, headers: corsHeaders(env) });
   }
   const taskMatch = path.match(/^\/v1\/tasks\/([^/]+)$/);
   if (taskMatch) {
@@ -568,7 +666,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     let task = await env.DB.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").bind(taskID, user.id).first<Record<string, any>>();
     if (!task) return error("Task not found", 404, "NOT_FOUND");
     if (request.method === "GET") {
-      task = await refreshViduTask(env, request, task, user);
+      task = await refreshViduTask(env, task, user);
       return json(taskResponse(request, task), { headers: corsHeaders(env) });
     }
   }
@@ -583,7 +681,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       template_id: artwork.template_id,
       template_title: artwork.template_title,
       kind: artwork.kind,
-      media_url: mediaURL(request, artwork.output_key),
+      media_url: artwork.result_url,
       watermark: Boolean(artwork.watermark),
       created_at: artwork.created_at
     }, { headers: corsHeaders(env) });
@@ -618,8 +716,8 @@ function inputAssetKey(task: Record<string, any>): string | null {
 }
 function taskResponse(request: Request, task: Record<string, any>): Record<string, unknown> {
   const inputKey = inputAssetKey(task);
-  const thumbnailKey = task.state === "succeeded" && task.kind === "image" && task.output_key
-    ? task.output_key
+  const thumbnailKey = task.state === "succeeded" && task.kind === "image" && task.result_url
+    ? task.result_url
     : inputKey;
   return {
     id: task.id,
@@ -628,15 +726,17 @@ function taskResponse(request: Request, task: Record<string, any>): Record<strin
     template_id: task.template_id || null,
     template_title: task.template_title || null,
     points: task.points,
-    progress: Number(task.progress || 0),
+    progress: Math.round(Number(task.progress || 0)),
     retry_count: Number(task.retry_count || 0),
     artwork_id: task.artwork_id,
     error_code: task.error_code,
     error_message: task.error_message,
     created_at: task.created_at,
     updated_at: task.updated_at,
-    media_url: task.output_key ? mediaURL(request, task.output_key) : null,
-    thumbnail_url: thumbnailKey ? mediaURL(request, thumbnailKey) : null
+    media_url: task.result_url || null,
+    thumbnail_url: task.state === "succeeded" && task.kind === "image" && task.result_url
+      ? task.result_url
+      : (thumbnailKey ? mediaURL(request, thumbnailKey) : null)
   };
 }
 
@@ -676,7 +776,7 @@ async function submitVidu(env: Env, taskID: string, snapshot: MaterialSnapshot, 
   }
 }
 
-async function refreshViduTask(env: Env, request: Request, task: Record<string, any>, user: User): Promise<Record<string, any>> {
+async function refreshViduTask(env: Env, task: Record<string, any>, user: User): Promise<Record<string, any>> {
   if (!task.provider_task_id || ["succeeded", "failed"].includes(String(task.state)) || !env.VIDU_API_KEY) return task;
   try {
     const response = await fetch(`${env.VIDU_BASE_URL || "https://api.vidu.com"}/ent/v2/tasks/${encodeURIComponent(String(task.provider_task_id))}/creations`, {
@@ -687,51 +787,38 @@ async function refreshViduTask(env: Env, request: Request, task: Record<string, 
     const state = String(body.state || "processing");
     if (["created", "queueing", "processing"].includes(state)) {
       const normalizedState = state === "processing" ? "processing" : "queued";
-      const progress = Math.max(1, Math.min(99, Number(body.progress || (normalizedState === "processing" ? 35 : 10))));
+      const progress = Math.round(Math.max(1, Math.min(99, Number(body.progress || (normalizedState === "processing" ? 35 : 10)))));
       if (normalizedState !== task.state || progress !== Number(task.progress || 0)) await env.DB.prepare("UPDATE tasks SET state = ?, progress = ?, updated_at = ? WHERE id = ? AND state NOT IN ('succeeded', 'failed')").bind(normalizedState, progress, now(), task.id).run();
       return { ...task, state: normalizedState, progress };
     }
     if (state === "failed") {
-      if (Number(task.retry_count || 0) < 1) {
-        let snapshot: MaterialSnapshot | null = null;
-        try {
-          const candidate = JSON.parse(String(task.material_snapshot_json || "null"));
-          snapshot = parseMaterialSnapshot(candidate, String(task.template_id));
-        } catch { /* invalid legacy snapshot */ }
-        if (snapshot) {
-          const retry = await env.DB.prepare("UPDATE tasks SET state = 'queued', retry_count = retry_count + 1, provider_task_id = NULL, progress = 0, error_code = NULL, error_message = NULL, updated_at = ? WHERE id = ? AND state NOT IN ('succeeded', 'failed') AND retry_count < 1")
-            .bind(now(), task.id).run();
-          if (Number(retry.meta?.changes || 0) > 0) {
-            let inputs: unknown[] = [];
-            try { inputs = JSON.parse(String(task.input_json || "[]")) as unknown[]; } catch { /* fall back to empty inputs */ }
-            await submitVidu(env, task.id, snapshot, inputs, user);
-            const retried = await env.DB.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").bind(task.id, user.id).first<Record<string, any>>();
-            if (retried) return retried;
-          }
-        }
-      }
       const failed = await env.DB.prepare("UPDATE tasks SET state = 'failed', progress = 0, error_code = ?, error_message = ?, updated_at = ? WHERE id = ? AND user_id = ? AND state NOT IN ('succeeded', 'failed')")
         .bind(body.err_code || "VIDU_GENERATION_FAILED", "Vidu could not generate the requested asset", now(), task.id, user.id)
         .run();
       if (Number(failed.meta?.changes || 0) > 0) await refundPoints(env, user, Number(task.points), `task:${task.id}:refund`);
-      return { ...task, state: "failed", error_code: body.err_code || "VIDU_GENERATION_FAILED" };
+      return { ...task, state: "failed", progress: 0, error_code: body.err_code || "VIDU_GENERATION_FAILED" };
     }
     if (state !== "success") return task;
-    const outputURL = task.kind === "image"
-      ? body.images?.find(item => typeof item === "string" && item.length > 0)
-      : body.creations?.find(item => typeof item.url === "string" && item.url.length > 0)?.url;
-    if (!outputURL) return task;
-    const mediaResponse = await fetch(outputURL);
-    if (!mediaResponse.ok || !mediaResponse.body) return task;
-    const extension = task.kind === "image" ? "jpg" : "mp4";
-    const contentType = task.kind === "image" ? "image/jpeg" : "video/mp4";
-    const outputKey = `users/${user.id}/outputs/${task.id}.${extension}`;
-    await env.ASSETS.put(outputKey, mediaResponse.body, { httpMetadata: { contentType } });
+    // Vidu's Get Creation API returns generated assets in `creations[].url`
+    // for both image and video tasks. Keep `images[]` as a compatibility
+    // fallback for older responses from the image endpoint.
+    const outputURL = body.creations?.find(item => typeof item.url === "string" && item.url.length > 0)?.url
+      || body.images?.find(item => typeof item === "string" && item.length > 0);
+    if (!outputURL) {
+      console.error("Vidu task succeeded without a result URL", {
+        taskID: task.id,
+        providerTaskID: task.provider_task_id,
+        kind: task.kind
+      });
+      return task;
+    }
     const artworkID = task.artwork_id || id();
-    await env.DB.prepare("UPDATE tasks SET state = 'succeeded', progress = 100, artwork_id = ?, output_key = ?, updated_at = ? WHERE id = ? AND state NOT IN ('succeeded', 'failed')").bind(artworkID, outputKey, now(), task.id).run();
+    await env.DB.prepare("UPDATE tasks SET state = 'succeeded', progress = 100, artwork_id = ?, result_url = ?, updated_at = ? WHERE id = ? AND state NOT IN ('succeeded', 'failed')")
+      .bind(artworkID, outputURL, now(), task.id).run();
     const artworkTitle = String(task.template_title || task.template_id || "自定义任务");
-    await env.DB.prepare("INSERT OR IGNORE INTO artworks(id, user_id, task_id, template_id, template_title, kind, output_key, watermark, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?)").bind(artworkID, user.id, task.id, task.template_id, artworkTitle, task.kind, outputKey, now()).run();
-    return { ...task, state: "succeeded", progress: 100, artwork_id: artworkID, output_key: outputKey };
+    await env.DB.prepare("INSERT OR IGNORE INTO artworks(id, user_id, task_id, template_id, template_title, kind, result_url, watermark, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, 0, ?)")
+      .bind(artworkID, user.id, task.id, task.template_id, artworkTitle, task.kind, outputURL, now()).run();
+    return { ...task, state: "succeeded", progress: 100, artwork_id: artworkID, result_url: outputURL };
   } catch (cause) {
     console.error("Vidu refresh failed", cause);
     return task;
@@ -760,13 +847,6 @@ export default {
     catch (cause) { console.error("Unhandled request failure", cause); return error("Internal server error", 500, "INTERNAL_ERROR"); }
   },
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
-    const cutoff = new Date(Date.now() - 30 * 60 * 1000).toISOString();
-    const result = await env.DB.prepare("SELECT id, user_id, points FROM tasks WHERE state IN ('queued', 'processing') AND updated_at < ? LIMIT 50").bind(cutoff).all<{ id: string; user_id: string; points: number }>();
-    for (const task of result.results || []) {
-      const update = await env.DB.prepare("UPDATE tasks SET state = 'failed', error_code = 'TASK_TIMEOUT', updated_at = ? WHERE id = ? AND state IN ('queued', 'processing')").bind(now(), task.id).run();
-      const user = await env.DB.prepare("SELECT id, customer_id, device_id FROM users WHERE id = ?").bind(task.user_id).first<User>();
-      if (user && Number(update.meta?.changes || 0) > 0) await refundPoints(env, user, task.points, `task:${task.id}:refund`);
-    }
     try { await cleanupOrphanUploads(env); }
     catch (cause) { console.error("Upload cleanup failed", cause); }
   }
