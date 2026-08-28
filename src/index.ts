@@ -6,6 +6,7 @@ export interface Env {
   REVENUECAT_VIRTUAL_CURRENCY_CODE: string;
   REVENUECAT_API_BASE_URL: string;
   REVENUECAT_SECRET_KEY?: string;
+  REVENUECAT_WEBHOOK_SIGNING_SECRET?: string;
   REVENUECAT_WEBHOOK_AUTH?: string;
   JWT_SECRET?: string;
   ACCESS_TOKEN_TTL_SECONDS: string;
@@ -351,40 +352,84 @@ const REVENUECAT_PRODUCTS: Record<string, { points: number; reason: string }> = 
   "com.hn.AIPetStudio.subscription.yearly": { points: 10000, reason: "subscription_points" }
 };
 
-function decodeWebhookSignature(value: string): Uint8Array | null {
-  const normalized = value.trim().replace(/^sha256=/i, "");
-  if (!normalized) return null;
-  if (/^[0-9a-f]{64}$/i.test(normalized)) {
-    const result = new Uint8Array(32);
-    for (let index = 0; index < result.length; index += 1) {
-      result[index] = Number.parseInt(normalized.slice(index * 2, index * 2 + 2), 16);
+type RevenueCatWebhookSignature = {
+  timestamp: number;
+  timestampText: string;
+  signatures: Uint8Array[];
+};
+
+/** RevenueCat sends `t=<unix timestamp>,v1=<hex HMAC>` in this header. */
+export function parseRevenueCatSignature(header: string | null): RevenueCatWebhookSignature | null {
+  if (!header) return null;
+  const fields = new Map<string, string[]>();
+  for (const part of header.split(",")) {
+    const separator = part.indexOf("=");
+    if (separator < 1) continue;
+    const name = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (!name || !value) continue;
+    fields.set(name, [...(fields.get(name) || []), value]);
+  }
+  const timestampText = fields.get("t")?.[0] || "";
+  if (!/^\d+$/.test(timestampText)) return null;
+  const timestamp = Number(timestampText);
+  if (!Number.isSafeInteger(timestamp)) return null;
+
+  const signatures = (fields.get("v1") || []).flatMap(value => {
+    if (!/^[0-9a-f]{64}$/i.test(value)) return [];
+    const bytes = new Uint8Array(32);
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
     }
-    return result;
-  }
-  try {
-    return Uint8Array.from(atob(normalized.replaceAll("-", "+").replaceAll("_", "/") + "===".slice((normalized.length + 3) % 4)), char => char.charCodeAt(0));
-  } catch {
-    return null;
-  }
+    return [bytes];
+  });
+  return signatures.length ? { timestamp, timestampText, signatures } : null;
 }
 
-async function verifyRevenueCatSignature(env: Env, rawBody: string, header: string | null): Promise<boolean> {
-  if (!env.REVENUECAT_WEBHOOK_AUTH || !header) return false;
-  const signature = decodeWebhookSignature(header);
-  if (!signature) return false;
+export async function verifyRevenueCatSignature(
+  env: Pick<Env, "REVENUECAT_WEBHOOK_SIGNING_SECRET">,
+  rawBody: string,
+  header: string | null,
+  nowMs = Date.now()
+): Promise<boolean> {
+  const secret = env.REVENUECAT_WEBHOOK_SIGNING_SECRET?.trim();
+  const parsed = parseRevenueCatSignature(header);
+  if (!secret || !parsed || Math.abs(nowMs / 1000 - parsed.timestamp) > 300) return false;
+
   const key = await crypto.subtle.importKey(
     "raw",
-    new TextEncoder().encode(env.REVENUECAT_WEBHOOK_AUTH),
+    new TextEncoder().encode(secret),
     { name: "HMAC", hash: "SHA-256" },
     false,
     ["verify"]
   );
-  const body = new TextEncoder().encode(rawBody);
-  return await crypto.subtle.verify("HMAC", key, signature as unknown as BufferSource, body);
+  const signedPayload = new TextEncoder().encode(`${parsed.timestampText}.${rawBody}`);
+  for (const signature of parsed.signatures) {
+    if (await crypto.subtle.verify("HMAC", key, signature as unknown as BufferSource, signedPayload)) return true;
+  }
+  return false;
+}
+
+function secureStringEquals(left: string, right: string): boolean {
+  const leftBytes = new TextEncoder().encode(left);
+  const rightBytes = new TextEncoder().encode(right);
+  let difference = leftBytes.length ^ rightBytes.length;
+  const length = Math.max(leftBytes.length, rightBytes.length);
+  for (let index = 0; index < length; index += 1) {
+    difference |= (leftBytes[index] || 0) ^ (rightBytes[index] || 0);
+  }
+  return difference === 0;
+}
+
+function verifyRevenueCatAuthorization(env: Env, request: Request): boolean {
+  const expected = env.REVENUECAT_WEBHOOK_AUTH?.trim();
+  if (!expected) return true;
+  return secureStringEquals(expected, request.headers.get("Authorization") || "");
 }
 
 async function handleRevenueCatWebhook(request: Request, env: Env): Promise<Response> {
-  if (!env.REVENUECAT_WEBHOOK_AUTH) return error("Webhook is not configured", 503, "CONFIGURATION_ERROR");
+  if (!env.REVENUECAT_WEBHOOK_SIGNING_SECRET?.trim()) return error("Webhook is not configured", 503, "CONFIGURATION_ERROR");
+  if (!verifyRevenueCatAuthorization(env, request)) return error("Invalid RevenueCat webhook authorization", 401, "INVALID_AUTHORIZATION");
   const rawBody = await request.text();
   if (!(await verifyRevenueCatSignature(env, rawBody, request.headers.get("X-RevenueCat-Webhook-Signature")))) {
     return error("Invalid RevenueCat webhook signature", 401, "INVALID_SIGNATURE");
