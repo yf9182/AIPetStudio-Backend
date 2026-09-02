@@ -345,10 +345,11 @@ function parseMaterialSnapshot(value: unknown, templateID: string | null): Mater
 
 const REVENUECAT_PRODUCTS: Record<string, { points: number; reason: string }> = {
   "com.hn.AIPetStudio.points.100": { points: 100, reason: "purchase_points" },
-  "com.hn.AIPetStudio.points.500": { points: 500, reason: "purchase_points" },
-  "com.hn.AIPetStudio.points.1000": { points: 1000, reason: "purchase_points" },
-  "com.hn.AIPetStudio.subscription.weekly": { points: 200, reason: "subscription_points" },
-  "com.hn.AIPetStudio.subscription.monthly": { points: 800, reason: "subscription_points" },
+  "com.hn.AIPetStudio.points.350": { points: 350, reason: "purchase_points" },
+  "com.hn.AIPetStudio.points.900": { points: 900, reason: "purchase_points" },
+  "com.hn.AIPetStudio.points.2200": { points: 2200, reason: "purchase_points" },
+  "com.hn.AIPetStudio.subscription.weekly": { points: 300, reason: "subscription_points" },
+  "com.hn.AIPetStudio.subscription.monthly": { points: 1200, reason: "subscription_points" },
   "com.hn.AIPetStudio.subscription.yearly": { points: 10000, reason: "subscription_points" }
 };
 
