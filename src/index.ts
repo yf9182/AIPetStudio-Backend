@@ -6,6 +6,7 @@ export interface Env {
   REVENUECAT_VIRTUAL_CURRENCY_CODE: string;
   REVENUECAT_API_BASE_URL: string;
   REVENUECAT_SECRET_KEY?: string;
+  REVENUECAT_V1_SECRET_KEY?: string;
   REVENUECAT_WEBHOOK_SIGNING_SECRET?: string;
   REVENUECAT_WEBHOOK_AUTH?: string;
   JWT_SECRET?: string;
@@ -238,7 +239,30 @@ async function debitPoints(env: Env, user: User, amount: number, reference: stri
   return current - amount;
 }
 async function refundPoints(env: Env, user: User, amount: number, reference: string): Promise<number> {
-  return await grantPoints(env, user, amount, "generation_refund", reference);
+  const pending = await env.DB.prepare("SELECT status FROM pending_refunds WHERE reference = ?").bind(reference).first<{ status: string }>();
+  if (pending?.status === "completed") return await getPoints(env, user);
+  if (!pending) await env.DB.prepare("INSERT OR IGNORE INTO pending_refunds(task_id, user_id, customer_id, amount, reference, status, attempts, updated_at) VALUES(?, ?, ?, ?, ?, 'pending', 0, ?)").bind(reference.replace(/^task:(.*):refund$/, "$1"), user.id, user.customer_id, amount, reference, now()).run();
+  try {
+    const balance = await grantPoints(env, user, amount, "generation_refund", reference);
+    await env.DB.prepare("UPDATE pending_refunds SET status = 'completed', attempts = attempts + 1, last_error = NULL, updated_at = ? WHERE reference = ?").bind(now(), reference).run();
+    return balance;
+  } catch (cause) {
+    await env.DB.prepare("UPDATE pending_refunds SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE reference = ?").bind(String(cause instanceof Error ? cause.message : cause).slice(0, 500), now(), reference).run();
+    throw cause;
+  }
+}
+async function retryPendingRefunds(env: Env, user: User): Promise<void> {
+  const rows = await env.DB.prepare("SELECT amount, reference FROM pending_refunds WHERE user_id = ? AND status = 'pending' ORDER BY updated_at LIMIT 10").bind(user.id).all<{ amount: number; reference: string }>();
+  for (const row of rows.results || []) {
+    try {
+      const providerBalance = await revenueCatAdjust(env, user.customer_id, row.amount, row.reference);
+      if (providerBalance === null) continue;
+      await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, 'generation_refund', ?, ?)").bind(id(), user.id, user.customer_id, row.amount, row.reference, now()).run();
+      await env.DB.prepare("UPDATE pending_refunds SET status = 'completed', attempts = attempts + 1, last_error = NULL, updated_at = ? WHERE reference = ?").bind(now(), row.reference).run();
+    } catch (cause) {
+      await env.DB.prepare("UPDATE pending_refunds SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE reference = ?").bind(String(cause instanceof Error ? cause.message : cause).slice(0, 500), now(), row.reference).run();
+    }
+  }
 }
 async function syncSignupPointsToRevenueCat(env: Env, user: User): Promise<boolean> {
   if (!env.REVENUECAT_SECRET_KEY) return false;
@@ -290,16 +314,16 @@ async function getPoints(env: Env, user: User): Promise<number> {
   return (await readPoints(env, user)).balance;
 }
 async function getEntitlement(env: Env, user: User): Promise<string | null> {
-  if (!env.REVENUECAT_SECRET_KEY) return null;
+  if (!env.REVENUECAT_V1_SECRET_KEY) return null;
   try {
     const endpoint = `${env.REVENUECAT_API_BASE_URL}/v1/subscribers/${encodeURIComponent(user.customer_id)}`;
     const response = await fetch(endpoint, {
       headers: {
-        Authorization: `Bearer ${env.REVENUECAT_SECRET_KEY}`,
+        Authorization: `Bearer ${env.REVENUECAT_V1_SECRET_KEY}`,
         Accept: "application/json"
       }
     });
-    if (!response.ok) return null;
+    if (!response.ok) throw new RevenueCatRequestError(response.status, `subscriber lookup failed (${response.status})`);
     const body = await response.json() as {
       subscriber?: {
         entitlements?: Record<string, { expires_date?: string | null; grace_period_expires_date?: string | null }>
@@ -449,6 +473,7 @@ async function handleRevenueCatWebhook(request: Request, env: Env): Promise<Resp
   const product = REVENUECAT_PRODUCTS[productID];
   const eventID = String(event.id || "").trim();
   const virtualTransactionID = String(event.virtual_currency_transaction_id || "").trim();
+  const storeTransactionID = String(event.transaction_id || event.store_transaction_id || "").trim();
   const eventKey = virtualTransactionID || eventID;
   if (!product || !eventKey) {
     console.warn("RevenueCat webhook ignored: unknown product or event identifier");
@@ -481,8 +506,8 @@ async function handleRevenueCatWebhook(request: Request, env: Env): Promise<Resp
   await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
     .bind(id(), user.id, user.customer_id, amount, reason, reference, now())
     .run();
-  const recorded = await env.DB.prepare("INSERT OR IGNORE INTO revenuecat_webhook_events(id, event_key, event_id, virtual_currency_transaction_id, customer_id, amount, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
-    .bind(id(), eventKey, eventID || null, virtualTransactionID || null, user.customer_id, amount, now())
+  const recorded = await env.DB.prepare("INSERT OR IGNORE INTO revenuecat_webhook_events(id, event_key, event_id, virtual_currency_transaction_id, store_transaction_id, customer_id, amount, created_at) VALUES(?, ?, ?, ?, ?, ?, ?, ?)")
+    .bind(id(), eventKey, eventID || null, virtualTransactionID || null, storeTransactionID || null, user.customer_id, amount, now())
     .run();
   return json({ ok: true, duplicate: Number(recorded.meta?.changes || 0) === 0 });
 }
@@ -529,6 +554,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     return json({ ok: true }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/wallet" && request.method === "GET") {
+    await retryPendingRefunds(env, user);
     let points: PointsRead;
     try { points = await readPoints(env, user); }
     catch (cause) {
@@ -556,6 +582,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
     return json({ items: transactions.results || [] }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/wallet/reconcile" && request.method === "POST") {
+    await retryPendingRefunds(env, user);
     let points: PointsRead;
     try { points = await readPoints(env, user); }
     catch (cause) {
@@ -569,6 +596,15 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       welcome_bonus_points: points.welcomeBonusGranted ? 20 : 0,
       transactions: []
     }, { headers: corsHeaders(env) });
+  }
+  if (path === "/v1/wallet/purchase-sync" && request.method === "POST") {
+    const body = await readBody(request);
+    const productID = String(body.product_id || "");
+    const transactionID = String(body.transaction_identifier || "");
+    const product = REVENUECAT_PRODUCTS[productID];
+    if (!product || !transactionID) return error("Invalid purchase", 422, "INVALID_PURCHASE");
+    const event = await env.DB.prepare("SELECT amount FROM revenuecat_webhook_events WHERE customer_id = ? AND (event_id = ? OR virtual_currency_transaction_id = ? OR store_transaction_id = ?) AND amount > 0").bind(user.customer_id, transactionID, transactionID, transactionID).first<{ amount: number }>();
+    return json({ confirmed: Boolean(event && Number(event.amount) === product.points), balance: await getPoints(env, user) }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/uploads/images" && request.method === "POST") {
     const form = await request.formData();
@@ -673,7 +709,14 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       const existing = await env.DB.prepare("SELECT * FROM tasks WHERE user_id = ? AND client_request_id = ?").bind(user.id, clientRequestID).first<Record<string, any>>();
       if (existing) return json(taskResponse(request, existing), { headers: corsHeaders(env) });
     }
-    const taskID = id();
+    const operation = await env.DB.prepare("INSERT OR IGNORE INTO task_operations(user_id, client_request_id, task_id, status, updated_at) VALUES(?, ?, ?, 'pending', ?)").bind(user.id, clientRequestID, id(), now()).run();
+    const operationRow = await env.DB.prepare("SELECT task_id, status FROM task_operations WHERE user_id = ? AND client_request_id = ?").bind(user.id, clientRequestID).first<{ task_id: string; status: string }>();
+    if (!operationRow) throw new Error("TASK_OPERATION_RESERVATION_FAILED");
+    if (Number(operation.meta?.changes || 0) === 0 && operationRow.status === "completed") {
+      const existing = await env.DB.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").bind(operationRow.task_id, user.id).first<Record<string, any>>();
+      if (existing) return json(taskResponse(request, existing), { headers: corsHeaders(env) });
+    }
+    const taskID = operationRow.task_id;
     const debitKey = `task:${taskID}:debit`;
     const generationCost = GENERATION_COSTS[snapshot.kind];
     try { await debitPoints(env, user, generationCost, debitKey); }
@@ -701,6 +744,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
       await submitVidu(env, taskID, snapshot, assetIDs, user);
     }
     const createdTask = await env.DB.prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?").bind(taskID, user.id).first<Record<string, any>>();
+    await env.DB.prepare("UPDATE task_operations SET status = 'completed', updated_at = ? WHERE user_id = ? AND client_request_id = ?").bind(now(), user.id, clientRequestID).run();
     return json(taskResponse(request, createdTask || {
       id: taskID, state: "queued", kind: snapshot.kind, points: generationCost, progress: 0,
       artwork_id: null, input_json: JSON.stringify(assetIDs)
