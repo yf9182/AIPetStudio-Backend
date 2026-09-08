@@ -1,3 +1,29 @@
+import {
+  AudioValidationError,
+  TranslationProviderError,
+  analyzeAudioWithGemini,
+  createAudioToken,
+  hashAudio,
+  inspectAudio,
+  translationConfig,
+  validateLanguage,
+  validateRequestID,
+  validateSpecies,
+  verifyAudioToken,
+  type HumanToPetResult,
+  type PetToHumanResult,
+  type Species,
+  type TranslationDirection
+} from "./petTranslator";
+import {
+  PET_SOUND_EMOTIONS,
+  PET_SOUND_LIBRARY_VERSION,
+  selectPetSound,
+  type PetSoundEmotion,
+  type PetSoundIntensity,
+  type PetSoundRecord
+} from "./petSoundLibrary";
+
 export interface Env {
   DB: D1Database;
   ASSETS: R2Bucket;
@@ -20,9 +46,21 @@ export interface Env {
   VIDU_BASE_URL?: string;
   VIDU_IMAGE_MODEL?: string;
   VIDU_VIDEO_MODEL?: string;
+  GEMINI_API_KEY?: string;
+  GEMINI_BASE_URL?: string;
+  GEMINI_MODEL?: string;
+  PET_TRANSLATOR_MAX_AUDIO_SECONDS?: string;
+  PET_TRANSLATOR_MAX_FILE_MB?: string;
+  PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST?: string;
+  PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST?: string;
+  PET_TRANSLATOR_RESULT_TTL_DAYS?: string;
+  PET_TRANSLATOR_AUDIO_URL_TTL_SECONDS?: string;
+  PET_TRANSLATOR_AUDIO_LIBRARY_READY?: string;
+  PET_TRANSLATOR_SOUND_LIBRARY_VERSION?: string;
+  PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED?: string;
 }
 
-type User = { id: string; customer_id: string; device_id: string; welcome_bonus_granted_at?: string | null };
+export type User = { id: string; customer_id: string; device_id: string; welcome_bonus_granted_at?: string | null };
 type MaterialSnapshot = {
   material_id: string;
   title: string;
@@ -185,11 +223,12 @@ async function ensureUser(env: Env, deviceID: string): Promise<User> {
   await env.DB.prepare("INSERT INTO users(id, customer_id, device_id, created_at, updated_at) VALUES(?, ?, ?, ?, ?)").bind(user.id, user.customer_id, user.device_id, now(), now()).run();
   return user;
 }
-async function revenueCatAdjust(env: Env, customerID: string, amount: number, reference: string): Promise<number | null> {
+async function revenueCatAdjust(env: Env, customerID: string, amount: number, reference: string, signal?: AbortSignal): Promise<number | null> {
   if (!env.REVENUECAT_SECRET_KEY) return null;
   const endpoint = `${env.REVENUECAT_API_BASE_URL}/v2/projects/${encodeURIComponent(env.REVENUECAT_PROJECT_ID)}/customers/${encodeURIComponent(customerID)}/virtual_currencies/transactions`;
   const response = await fetch(endpoint, {
     method: "POST",
+    ...(signal ? { signal } : {}),
     headers: {
       Authorization: `Bearer ${env.REVENUECAT_SECRET_KEY}`,
       "Content-Type": "application/json",
@@ -264,14 +303,14 @@ async function retryPendingRefunds(env: Env, user: User): Promise<void> {
     }
   }
 }
-async function syncSignupPointsToRevenueCat(env: Env, user: User): Promise<boolean> {
+async function syncSignupPointsToRevenueCat(env: Env, user: User, signal?: AbortSignal): Promise<boolean> {
   if (!env.REVENUECAT_SECRET_KEY) return false;
   if (user.welcome_bonus_granted_at) return false;
   const amount = 20;
   const reference = `signup:${user.id}`;
   // The first bootstrap can happen before the RevenueCat SDK creates this
   // customer. Reusing the signup reference makes the later retry idempotent.
-  const providerBalance = await revenueCatAdjust(env, user.customer_id, amount, reference);
+  const providerBalance = await revenueCatAdjust(env, user.customer_id, amount, reference, signal);
   if (providerBalance === null) return false;
   const grantedAt = now();
   await env.DB.prepare("UPDATE users SET welcome_bonus_granted_at = ?, updated_at = ? WHERE id = ? AND welcome_bonus_granted_at IS NULL")
@@ -281,8 +320,9 @@ async function syncSignupPointsToRevenueCat(env: Env, user: User): Promise<boole
   return true;
 }
 type PointsRead = { balance: number; welcomeBonusGranted: boolean };
-async function revenueCatBalance(env: Env, user: User): Promise<number | null> {
+async function revenueCatBalance(env: Env, user: User, signal?: AbortSignal): Promise<number | null> {
   const response = await fetch(`${env.REVENUECAT_API_BASE_URL}/v2/projects/${encodeURIComponent(env.REVENUECAT_PROJECT_ID)}/customers/${encodeURIComponent(user.customer_id)}/virtual_currencies`, {
+    ...(signal ? { signal } : {}),
     headers: { Authorization: `Bearer ${env.REVENUECAT_SECRET_KEY}` }
   });
   if (response.status === 404) return null;
@@ -365,6 +405,589 @@ function parseMaterialSnapshot(value: unknown, templateID: string | null): Mater
     image_count: body.image_count,
     source_updated_at: body.source_updated_at === undefined || body.source_updated_at === null ? null : body.source_updated_at
   };
+}
+
+type PetTranslationTask = Record<string, any> & {
+  id: string;
+  user_id: string;
+  request_id: string;
+  request_fingerprint: string;
+  direction: TranslationDirection;
+  species: Species;
+  language: "zh-CN";
+  state: "reserved" | "processing" | "succeeded" | "failed" | "expired";
+  debit_status: "pending" | "confirmed" | "unknown" | "not_required";
+  refund_status: "none" | "pending" | "completed" | "manual_review";
+  audio_source?: "none" | "generated" | "shared_library";
+  sound_id?: string | null;
+  sound_library_version?: string | null;
+  sound_emotion?: PetSoundEmotion | null;
+  sound_intensity?: PetSoundIntensity | null;
+  sound_duration_seconds?: number | null;
+};
+
+type TranslationInput = {
+  requestID: string;
+  fingerprint: string;
+  species: Species;
+  language: "zh-CN";
+  bytes: Uint8Array;
+  metadata: ReturnType<typeof inspectAudio>;
+};
+
+function positiveConfigNumber(value: string | undefined, fallback: number, maximum: number): number {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.min(parsed, maximum) : fallback;
+}
+
+function translationMaxSeconds(env: Env): number {
+  return positiveConfigNumber(env.PET_TRANSLATOR_MAX_AUDIO_SECONDS, 15, 15);
+}
+
+function translationMaxBytes(env: Env): number {
+  return Math.round(positiveConfigNumber(env.PET_TRANSLATOR_MAX_FILE_MB, 10, 10) * 1024 * 1024);
+}
+
+function translationResultTTLDays(env: Env): number {
+  return positiveConfigNumber(env.PET_TRANSLATOR_RESULT_TTL_DAYS, 7, 7);
+}
+
+function translationAudioURLTTLSeconds(env: Env): number {
+  return Math.round(positiveConfigNumber(env.PET_TRANSLATOR_AUDIO_URL_TTL_SECONDS, 900, 900));
+}
+
+function translationExpiry(env: Env, createdAt = Date.now()): string {
+  return new Date(createdAt + translationResultTTLDays(env) * 24 * 60 * 60 * 1000).toISOString();
+}
+
+function translationSoundLibraryVersion(env: Env): string {
+  return env.PET_TRANSLATOR_SOUND_LIBRARY_VERSION?.trim() || PET_SOUND_LIBRARY_VERSION;
+}
+
+function translationSoundLibraryMinimum(env: Env): number {
+  const parsed = Number(env.PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED || 80);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? Math.min(parsed, 10_000) : 80;
+}
+
+async function petSoundLibraryReady(env: Env): Promise<boolean> {
+  if (env.PET_TRANSLATOR_AUDIO_LIBRARY_READY !== "true") return false;
+  const version = translationSoundLibraryVersion(env);
+  if (version !== PET_SOUND_LIBRARY_VERSION) return false;
+  const row = await env.DB.prepare("SELECT COUNT(*) AS count FROM pet_translator_sounds WHERE library_version = ? AND review_status = 'approved'")
+    .bind(version).first<{ count: number }>();
+  return Number(row?.count || 0) >= translationSoundLibraryMinimum(env);
+}
+
+function ensureTranslationDeadline(deadline: number, reserveMs = 250): void {
+  if (Date.now() >= deadline - reserveMs) throw new TranslationProviderError("PET_TRANSLATOR_TIMEOUT", "translation request timed out", 504, true);
+}
+
+async function readTranslationInput(request: Request, env: Env, direction: TranslationDirection): Promise<TranslationInput> {
+  const requestID = validateRequestID(request.headers.get("X-Request-ID"));
+  const maxBytes = translationMaxBytes(env);
+  const contentLength = Number(request.headers.get("Content-Length") || 0);
+  // Multipart overhead is allowed, while an obviously oversized body is
+  // rejected before form parsing allocates it in the Worker.
+  if (Number.isSafeInteger(contentLength) && contentLength > maxBytes + 1_048_576) {
+    throw new AudioValidationError("PET_TRANSLATOR_002", "audio is too large", 413);
+  }
+  let form: FormData;
+  try { form = await request.formData(); }
+  catch { throw new AudioValidationError("PET_TRANSLATOR_001", "a multipart audio request is required", 422); }
+  const unsupported = [...form.keys()].find(key => !["audio", "species", "language"].includes(key));
+  if (unsupported) throw new AudioValidationError("PET_TRANSLATOR_008", `unsupported field: ${unsupported}`, 422);
+  if (form.getAll("audio").length !== 1 || form.getAll("species").length !== 1 || form.getAll("language").length > 1) {
+    throw new AudioValidationError("PET_TRANSLATOR_008", "audio, species and language may only be supplied once", 422);
+  }
+  const audio = form.get("audio");
+  if (!(audio instanceof Blob)) throw new AudioValidationError("PET_TRANSLATOR_001", "audio is required", 422);
+  const species = validateSpecies(form.get("species"));
+  const language = validateLanguage(form.get("language"));
+  const bytes = new Uint8Array(await audio.arrayBuffer());
+  const metadata = inspectAudio(bytes, audio.type, translationMaxSeconds(env), maxBytes);
+  const fingerprint = `${direction}:${species}:${language}:${await hashAudio(bytes)}`;
+  return { requestID, fingerprint, species, language, bytes, metadata };
+}
+
+async function loadTranslationTask(env: Env, userID: string, taskID: string): Promise<PetTranslationTask | null> {
+  return await env.DB.prepare("SELECT * FROM pet_translation_tasks WHERE id = ? AND user_id = ?").bind(taskID, userID).first<PetTranslationTask>();
+}
+
+async function loadTranslationTaskByRequest(env: Env, userID: string, requestID: string): Promise<PetTranslationTask | null> {
+  return await env.DB.prepare("SELECT * FROM pet_translation_tasks WHERE user_id = ? AND request_id = ?").bind(userID, requestID).first<PetTranslationTask>();
+}
+
+async function updateTranslationTask(env: Env, taskID: string, values: Record<string, unknown>): Promise<void> {
+  const allowed = new Set([
+    "state", "phase", "debit_status", "refund_status", "result_json", "output_key", "error_code", "error_message",
+    "gemini_model", "gemini_latency_ms", "gemini_input_tokens", "gemini_output_tokens", "sound_model", "sound_latency_ms", "sound_character_cost",
+    "audio_source", "sound_id", "sound_library_version", "sound_emotion", "sound_intensity", "sound_duration_seconds", "updated_at"
+  ]);
+  const entries = Object.entries(values).filter(([key]) => allowed.has(key));
+  if (!entries.length) return;
+  const assignments = entries.map(([key]) => `${key} = ?`).join(", ");
+  const bindings = entries.map(([, value]) => value === undefined ? null : value);
+  await env.DB.prepare(`UPDATE pet_translation_tasks SET ${assignments} WHERE id = ?`).bind(...bindings, taskID).run();
+}
+
+function parseTranslationResult(task: PetTranslationTask): Record<string, unknown> {
+  if (typeof task.result_json !== "string" || !task.result_json) return {};
+  try {
+    const result = JSON.parse(task.result_json) as unknown;
+    return result && typeof result === "object" && !Array.isArray(result) ? result as Record<string, unknown> : {};
+  } catch { return {}; }
+}
+
+async function translationAudioStorageKey(env: Env, task: PetTranslationTask): Promise<string | null> {
+  if (task.state !== "succeeded") return null;
+  if (task.audio_source === "shared_library") {
+    if (!task.sound_id || !task.sound_library_version) return null;
+    const sound = await env.DB.prepare("SELECT storage_key FROM pet_translator_sounds WHERE id = ? AND library_version = ? AND review_status = 'approved'")
+      .bind(task.sound_id, task.sound_library_version).first<{ storage_key: string }>();
+    return sound?.storage_key || null;
+  }
+  return task.output_key || null;
+}
+
+async function translationAudioURL(request: Request, env: Env, task: PetTranslationTask): Promise<string | null> {
+  const storageKey = await translationAudioStorageKey(env, task);
+  if (!storageKey || !env.JWT_SECRET?.trim()) return null;
+  const expiresAt = Math.floor(Date.parse(task.expires_at) / 1000);
+  const expires = Math.min(expiresAt, Math.floor(Date.now() / 1000) + translationAudioURLTTLSeconds(env));
+  if (!Number.isSafeInteger(expires) || expires <= Math.floor(Date.now() / 1000)) return null;
+  const token = await createAudioToken(env.JWT_SECRET.trim(), task.id, storageKey, expires);
+  return `${new URL(request.url).origin}/v1/pet-translator/audio/${encodeURIComponent(task.id)}?token=${encodeURIComponent(token)}`;
+}
+
+async function translationData(request: Request, env: Env, task: PetTranslationTask): Promise<Record<string, unknown>> {
+  const result = task.state === "expired" ? {} : parseTranslationResult(task);
+  const soundID = task.state === "expired" ? null : task.sound_id || null;
+  const soundEmotion = task.state === "expired" ? null : task.sound_emotion || null;
+  const soundIntensity = task.state === "expired" ? null : task.sound_intensity || null;
+  const soundDuration = task.state === "expired" ? null : task.sound_duration_seconds ?? null;
+  const soundLibraryVersion = task.state === "expired" ? null : task.sound_library_version || null;
+  return {
+    task_id: task.id,
+    direction: task.direction,
+    species: task.species,
+    language: task.language,
+    state: task.state,
+    phase: task.phase,
+    is_valid: typeof result.is_valid === "boolean" ? result.is_valid : null,
+    emotion: result.emotion ?? null,
+    intent: result.intent ?? null,
+    translation: result.translation ?? null,
+    confidence: result.confidence ?? null,
+    explanation: result.explanation ?? null,
+    transcript: result.transcript ?? null,
+    meaning: result.meaning ?? null,
+    intensity: result.intensity ?? null,
+    audio_url: await translationAudioURL(request, env, task),
+    sound_id: soundID,
+    sound_emotion: soundEmotion,
+    sound_intensity: soundIntensity,
+    audio_duration_seconds: soundDuration,
+    sound_library_version: soundLibraryVersion,
+    credit_cost: task.credit_cost,
+    debit_status: task.debit_status,
+    refund_status: task.refund_status,
+    error_code: task.error_code || null,
+    error_message: task.error_message || null,
+    created_at: task.created_at,
+    updated_at: task.updated_at,
+    expires_at: task.expires_at
+  };
+}
+
+function translationEnvelope(data: Record<string, unknown>): Record<string, unknown> {
+  return { code: 0, message: "success", data };
+}
+
+function translatorError(env: Env, message: string, status = 400, code = "BAD_REQUEST"): Response {
+  return json({ error: { code, message } }, { status, headers: { ...corsHeaders(env), "cache-control": "no-store" } });
+}
+
+function translationErrorWithTask(env: Env, taskID: string, state: string, code: string, message: string, status: number): Response {
+  return json({ error: { code, message }, data: { task_id: taskID, state } }, { status, headers: { ...corsHeaders(env), "cache-control": "no-store" } });
+}
+
+function translationFailureStatus(code: string | null): number {
+  if (code === "PET_TRANSLATOR_101") return 402;
+  if (code === "PET_TRANSLATOR_TIMEOUT") return 504;
+  if (code?.endsWith("_NOT_CONFIGURED") || code === "PET_TRANSLATOR_201" || code === "PET_TRANSLATOR_301" || code === "CREDIT_DEBIT_UNKNOWN" || code === "POINTS_PROVIDER_ERROR" || code === "PET_TRANSLATOR_INTERRUPTED") return 503;
+  if (code?.startsWith("PET_TRANSLATOR_2")) return 502;
+  return 502;
+}
+
+async function expireTranslationTaskIfNeeded(env: Env, task: PetTranslationTask): Promise<PetTranslationTask> {
+  if (task.state === "expired" || !task.expires_at || Date.parse(task.expires_at) > Date.now()) return task;
+  let deleted = true;
+  if (task.output_key) {
+    try { await env.ASSETS.delete(task.output_key); } catch (cause) { deleted = false; console.error("Expired pet translation cleanup failed", cause); }
+  }
+  const outputKey = deleted ? null : task.output_key;
+  await updateTranslationTask(env, task.id, {
+    state: "expired",
+    phase: "expired",
+    result_json: null,
+    output_key: outputKey,
+    audio_source: "none",
+    sound_id: null,
+    sound_library_version: null,
+    sound_emotion: null,
+    sound_intensity: null,
+    sound_duration_seconds: null,
+    updated_at: now()
+  });
+  return {
+    ...task,
+    state: "expired",
+    phase: "expired",
+    result_json: null,
+    output_key: outputKey,
+    audio_source: "none",
+    sound_id: null,
+    sound_library_version: null,
+    sound_emotion: null,
+    sound_intensity: null,
+    sound_duration_seconds: null
+  };
+}
+
+async function respondWithTranslationTask(request: Request, env: Env, task: PetTranslationTask, status = 200): Promise<Response> {
+  task = await expireTranslationTaskIfNeeded(env, task);
+  if (task.state === "expired") return translationErrorWithTask(env, task.id, task.state, "PET_TRANSLATOR_RESULT_EXPIRED", "translation result has expired", 410);
+  if (task.state === "failed") {
+    return translationErrorWithTask(env, task.id, task.state, task.error_code || "PET_TRANSLATOR_500", task.error_message || "translation failed", translationFailureStatus(task.error_code || null));
+  }
+  return json(translationEnvelope(await translationData(request, env, task)), { status, headers: { ...corsHeaders(env), "cache-control": "no-store" } });
+}
+
+type TranslationDebitOutcome = "confirmed" | "insufficient" | "unavailable" | "unknown";
+
+async function withRevenueCatDeadline<T>(deadline: number, operation: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const remaining = Math.min(10_000, deadline - Date.now() - 250);
+  if (remaining <= 0) throw new Error("POINTS_REQUEST_TIMED_OUT");
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), remaining);
+  try { return await operation(controller.signal); }
+  finally { clearTimeout(timer); }
+}
+
+async function debitTranslationPoints(env: Env, user: User, amount: number, reference: string, deadline: number): Promise<TranslationDebitOutcome> {
+  const already = await env.DB.prepare("SELECT id FROM credit_ledger WHERE reference = ?").bind(reference).first<{ id: string }>();
+  if (already) return "confirmed";
+  let current: number;
+  try {
+    await withRevenueCatDeadline(deadline, signal => syncSignupPointsToRevenueCat(env, user, signal));
+    const providerBalance = await withRevenueCatDeadline(deadline, signal => revenueCatBalance(env, user, signal));
+    if (providerBalance === null) return "unavailable";
+    current = providerBalance;
+  }
+  catch { return "unavailable"; }
+  if (current < amount) return "insufficient";
+  try {
+    const providerBalance = await withRevenueCatDeadline(deadline, signal => revenueCatAdjust(env, user.customer_id, -amount, reference, signal));
+    if (providerBalance === null) return "unavailable";
+  } catch (cause) {
+    if (cause instanceof RevenueCatRequestError && cause.status === 422 && /balance|enough|insufficient/i.test(cause.providerMessage || "")) return "insufficient";
+    return "unknown";
+  }
+  try {
+    await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, 'generation_debit', ?, ?)")
+      .bind(id(), user.id, user.customer_id, -amount, reference, now()).run();
+    return "confirmed";
+  } catch {
+    // RevenueCat has already accepted the idempotent adjustment. Do not issue
+    // a refund until an operator/reconciliation pass confirms its outcome.
+    return "unknown";
+  }
+}
+
+async function refundTranslationPoints(env: Env, user: User, taskID: string, amount: number, deadline?: number): Promise<"completed" | "pending"> {
+  const reference = `pet-translator:${taskID}:refund`;
+  try {
+    const existing = await env.DB.prepare("SELECT status FROM pending_refunds WHERE reference = ?").bind(reference).first<{ status: string }>();
+    if (existing?.status === "completed") return "completed";
+    if (!existing) await env.DB.prepare("INSERT OR IGNORE INTO pending_refunds(task_id, user_id, customer_id, amount, reference, status, attempts, updated_at) VALUES(?, ?, ?, ?, ?, 'pending', 0, ?)")
+      .bind(taskID, user.id, user.customer_id, amount, reference, now()).run();
+    const providerBalance = deadline === undefined
+      ? await revenueCatAdjust(env, user.customer_id, amount, reference)
+      : await withRevenueCatDeadline(deadline, signal => revenueCatAdjust(env, user.customer_id, amount, reference, signal));
+    if (providerBalance === null) return "pending";
+    await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, 'generation_refund', ?, ?)")
+      .bind(id(), user.id, user.customer_id, amount, reference, now()).run();
+    await env.DB.prepare("UPDATE pending_refunds SET status = 'completed', attempts = attempts + 1, last_error = NULL, updated_at = ? WHERE reference = ?")
+      .bind(now(), reference).run();
+    return "completed";
+  } catch (cause) {
+    try {
+      await env.DB.prepare("UPDATE pending_refunds SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE reference = ?")
+        .bind(String(cause instanceof Error ? cause.message : cause).slice(0, 500), now(), reference).run();
+    } catch (recordingCause) {
+      console.error("Pet translation refund state could not be recorded", { taskID, cause: recordingCause });
+    }
+    return "pending";
+  }
+}
+
+async function failTranslationTask(env: Env, taskID: string, user: User, cost: number, code: string, message: string, debitStatus: PetTranslationTask["debit_status"], shouldRefund: boolean, deadline?: number, resultJSON?: string | null): Promise<void> {
+  let refundStatus: PetTranslationTask["refund_status"] = "none";
+  if (shouldRefund) refundStatus = (await refundTranslationPoints(env, user, taskID, cost, deadline)) === "completed" ? "completed" : "pending";
+  const values: Record<string, unknown> = {
+    state: "failed",
+    phase: shouldRefund && refundStatus === "pending" ? "refund_pending" : "failed",
+    debit_status: debitStatus,
+    refund_status: refundStatus,
+    error_code: code,
+    error_message: message.slice(0, 500),
+    updated_at: now()
+  };
+  if (resultJSON !== undefined) values.result_json = resultJSON;
+  await updateTranslationTask(env, taskID, values);
+}
+
+async function processTranslationTask(env: Env, taskID: string, user: User, input: TranslationInput, direction: TranslationDirection, cost: number, ctx: ExecutionContext, deadline: number): Promise<void> {
+  const startedAt = Date.now();
+  const debitKey = `pet-translator:${taskID}:debit`;
+  let debitStatus: PetTranslationTask["debit_status"] = "pending";
+  try {
+    if (Date.now() >= deadline - 250) {
+      await failTranslationTask(env, taskID, user, cost, "PET_TRANSLATOR_TIMEOUT", "translation request timed out", "not_required", false, deadline);
+      return;
+    }
+    await updateTranslationTask(env, taskID, { phase: "billing", updated_at: now() });
+    const debit = await debitTranslationPoints(env, user, cost, debitKey, deadline);
+    if (debit === "insufficient") {
+      await failTranslationTask(env, taskID, user, cost, "PET_TRANSLATOR_101", "not enough credits", "not_required", false);
+      return;
+    }
+    if (debit === "unavailable") {
+      await failTranslationTask(env, taskID, user, cost, "POINTS_PROVIDER_ERROR", "points service is temporarily unavailable", "not_required", false);
+      return;
+    }
+    if (debit === "unknown") {
+      debitStatus = "unknown";
+      await updateTranslationTask(env, taskID, { state: "failed", phase: "manual_review", debit_status: "unknown", refund_status: "manual_review", error_code: "CREDIT_DEBIT_UNKNOWN", error_message: "credit adjustment outcome requires reconciliation", updated_at: now() });
+      return;
+    }
+    debitStatus = "confirmed";
+    await updateTranslationTask(env, taskID, { state: "processing", phase: "gemini", debit_status: debitStatus, updated_at: now() });
+    const analysis = await analyzeAudioWithGemini(env, direction, input.species, input.language, input.bytes, input.metadata.mimeType, deadline);
+    ensureTranslationDeadline(deadline);
+    await updateTranslationTask(env, taskID, {
+      phase: direction === "HUMAN_TO_PET" && (analysis.result as HumanToPetResult).is_valid ? "sound_matching" : "persisting",
+      gemini_model: analysis.model,
+      gemini_latency_ms: analysis.latencyMs,
+      gemini_input_tokens: analysis.inputTokens,
+      gemini_output_tokens: analysis.outputTokens,
+      updated_at: now()
+    });
+    if (!analysis.result.is_valid) {
+      const refundStatus = (await refundTranslationPoints(env, user, taskID, cost, deadline)) === "completed" ? "completed" : "pending";
+      await updateTranslationTask(env, taskID, {
+        // The business result is available immediately, but keep the task in
+        // processing until a pending credit refund is confirmed. This avoids
+        // reporting a completed task while the user's balance is unresolved.
+        state: refundStatus === "completed" ? "succeeded" : "processing",
+        phase: refundStatus === "completed" ? "completed" : "refund_pending",
+        result_json: JSON.stringify(analysis.result),
+        refund_status: refundStatus,
+        error_code: null,
+        error_message: null,
+        updated_at: now()
+      });
+      console.log("Pet translation completed", { task_id: taskID, direction, species: input.species, gemini_latency_ms: analysis.latencyMs, total_latency_ms: Date.now() - startedAt, success: true, valid_audio: false });
+      return;
+    }
+    if (direction === "PET_TO_HUMAN") {
+      await updateTranslationTask(env, taskID, { state: "succeeded", phase: "completed", result_json: JSON.stringify(analysis.result), updated_at: now() });
+      console.log("Pet translation completed", { task_id: taskID, direction, species: input.species, gemini_latency_ms: analysis.latencyMs, total_latency_ms: Date.now() - startedAt, success: true, valid_audio: true });
+      return;
+    }
+    const humanResult = analysis.result as HumanToPetResult;
+    if (!humanResult.emotion || !PET_SOUND_EMOTIONS.includes(humanResult.emotion)) {
+      throw new TranslationProviderError("PET_TRANSLATOR_202", "Gemini returned an unsupported emotion");
+    }
+    const libraryVersion = translationSoundLibraryVersion(env);
+    const soundRows = await env.DB.prepare(`
+      SELECT id, library_version, species, emotion, intensity, vocalization, storage_key,
+             duration_seconds, mime_type, source_url, source_author, source_license,
+             source_title, source_license_url, downloaded_at, sha256, review_status
+      FROM pet_translator_sounds
+      WHERE library_version = ? AND species = ? AND emotion = ? AND review_status = 'approved'
+    `).bind(libraryVersion, input.species, humanResult.emotion).all<PetSoundRecord>();
+    ensureTranslationDeadline(deadline);
+    const sound = selectPetSound(soundRows.results || [], input.species, humanResult.emotion, humanResult.intensity, taskID);
+    if (!sound) {
+      await failTranslationTask(env, taskID, user, cost, "PET_TRANSLATOR_SOUND_UNAVAILABLE", "no reviewed pet sound is available for the detected emotion", debitStatus, true, deadline, JSON.stringify(analysis.result));
+      console.log("Pet translation completed", { task_id: taskID, direction, species: input.species, gemini_latency_ms: analysis.latencyMs, total_latency_ms: Date.now() - startedAt, success: false, valid_audio: true, sound_available: false });
+      return;
+    }
+    ensureTranslationDeadline(deadline);
+    await updateTranslationTask(env, taskID, {
+      state: "succeeded",
+      phase: "completed",
+      result_json: JSON.stringify(analysis.result),
+      audio_source: "shared_library",
+      output_key: null,
+      sound_id: sound.id,
+      sound_library_version: sound.library_version,
+      sound_emotion: sound.emotion,
+      sound_intensity: sound.intensity,
+      sound_duration_seconds: sound.duration_seconds,
+      error_code: null,
+      error_message: null,
+      updated_at: now()
+    });
+    console.log("Pet translation completed", { task_id: taskID, direction, species: input.species, gemini_latency_ms: analysis.latencyMs, sound_id: sound.id, sound_library_version: sound.library_version, total_latency_ms: Date.now() - startedAt, success: true, valid_audio: true });
+  } catch (cause) {
+    const provider = cause instanceof TranslationProviderError ? cause : null;
+    const code = provider?.code || "PET_TRANSLATOR_500";
+    const message = provider?.message || (cause instanceof Error ? cause.message : "translation failed");
+    console.error("Pet translation failed", { task_id: taskID, direction, species: input.species, error_code: code, success: false });
+    if (debitStatus === "confirmed") {
+      await failTranslationTask(env, taskID, user, cost, code, message, debitStatus, true, deadline);
+    } else {
+      await updateTranslationTask(env, taskID, { state: "failed", phase: "failed", debit_status: debitStatus, refund_status: "none", error_code: code, error_message: message.slice(0, 500), updated_at: now() });
+    }
+  }
+  void ctx;
+}
+
+async function recoverStaleTranslationTasks(env: Env, userID: string): Promise<void> {
+  const reservedCutoff = new Date(Date.now() - 2 * 60_000).toISOString();
+  const processingCutoff = new Date(Date.now() - 5 * 60_000).toISOString();
+  const rows = await env.DB.prepare(`
+    SELECT * FROM pet_translation_tasks
+    WHERE user_id = ? AND ((state = 'reserved' AND updated_at < ?) OR (state = 'processing' AND updated_at < ?))
+    LIMIT 10
+  `).bind(userID, reservedCutoff, processingCutoff).all<PetTranslationTask>();
+  for (const task of rows.results || []) {
+    const debit = await env.DB.prepare("SELECT id FROM credit_ledger WHERE reference = ?").bind(task.debit_key).first<{ id: string }>();
+    if (debit || task.debit_status === "confirmed") {
+      const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE id = ? AND deleted_at IS NULL").bind(userID).first<User>();
+      if (user) await failTranslationTask(env, task.id, user, Number(task.credit_cost), "PET_TRANSLATOR_INTERRUPTED", "translation was interrupted and requires a credit refund", "confirmed", true);
+      continue;
+    }
+    if (task.debit_status === "unknown") {
+      await updateTranslationTask(env, task.id, { state: "failed", phase: "manual_review", refund_status: "manual_review", error_code: "CREDIT_DEBIT_UNKNOWN", error_message: "credit adjustment outcome requires reconciliation", updated_at: now() });
+    } else {
+      await updateTranslationTask(env, task.id, { state: "expired", phase: "expired", debit_status: "not_required", error_code: "PET_TRANSLATOR_INTERRUPTED", error_message: "translation request expired before processing", updated_at: now() });
+    }
+  }
+}
+
+async function handleTranslationRequest(request: Request, env: Env, user: User, direction: TranslationDirection, ctx: ExecutionContext): Promise<Response> {
+  const deadline = Date.now() + 60_000;
+  let input: TranslationInput;
+  try { input = await readTranslationInput(request, env, direction); }
+  catch (cause) {
+    if (cause instanceof AudioValidationError) return translatorError(env, cause.message, cause.status, cause.code);
+    return translatorError(env, "Invalid translation request", 422, "PET_TRANSLATOR_001");
+  }
+  const existing = await loadTranslationTaskByRequest(env, user.id, input.requestID);
+  if (existing) {
+    if (existing.request_fingerprint !== input.fingerprint) return translatorError(env, "X-Request-ID was already used for different audio", 409, "IDEMPOTENCY_KEY_REUSED");
+    return respondWithTranslationTask(request, env, existing);
+  }
+  const config = translationConfig(env, direction);
+  if (!config.enabled) return translatorError(env, "Pet translator is temporarily unavailable", 503, "PET_TRANSLATOR_NOT_CONFIGURED");
+  if (direction === "HUMAN_TO_PET" && !(await petSoundLibraryReady(env))) {
+    return translatorError(env, "Pet sound library is temporarily unavailable", 503, "PET_TRANSLATOR_SOUND_LIBRARY_NOT_READY");
+  }
+  const minuteAgo = new Date(Date.now() - 60_000).toISOString();
+  const recent = await env.DB.prepare("SELECT COUNT(*) AS count FROM pet_translation_tasks WHERE user_id = ? AND created_at >= ?").bind(user.id, minuteAgo).first<{ count: number }>();
+  if (Number(recent?.count || 0) >= 5) return translatorError(env, "Too many translation requests", 429, "PET_TRANSLATOR_RATE_LIMITED");
+  await recoverStaleTranslationTasks(env, user.id);
+  const active = await env.DB.prepare("SELECT id FROM pet_translation_tasks WHERE user_id = ? AND state IN ('reserved', 'processing') LIMIT 1").bind(user.id).first<{ id: string }>();
+  if (active) return translatorError(env, "A translation is already processing", 409, "PET_TRANSLATOR_BUSY");
+  const taskID = id();
+  const createdAt = now();
+  try {
+    await env.DB.prepare(`
+      INSERT INTO pet_translation_tasks(
+        id, user_id, request_id, request_fingerprint, direction, species, language, state, phase,
+        credit_cost, debit_key, debit_status, refund_status, input_mime_type, input_size,
+        input_duration_seconds, audio_source, created_at, updated_at, expires_at
+      ) VALUES(?, ?, ?, ?, ?, ?, ?, 'reserved', 'reserved', ?, ?, 'pending', 'none', ?, ?, ?, ?, ?, ?, ?)
+    `).bind(taskID, user.id, input.requestID, input.fingerprint, direction, input.species, input.language, config.cost, `pet-translator:${taskID}:debit`, input.metadata.mimeType, input.bytes.length, input.metadata.durationSeconds, "none", createdAt, createdAt, translationExpiry(env)).run();
+  } catch (cause) {
+    const raced = await loadTranslationTaskByRequest(env, user.id, input.requestID);
+    if (raced) {
+      if (raced.request_fingerprint !== input.fingerprint) return translatorError(env, "X-Request-ID was already used for different audio", 409, "IDEMPOTENCY_KEY_REUSED");
+      return respondWithTranslationTask(request, env, raced);
+    }
+    if (String(cause).toLowerCase().includes("unique")) return translatorError(env, "A translation is already processing", 409, "PET_TRANSLATOR_BUSY");
+    throw cause;
+  }
+  const processing = processTranslationTask(env, taskID, user, input, direction, config.cost, ctx, deadline);
+  // Keep the persisted task progressing if the client disconnects while the
+  // provider calls are still in flight; the caller can recover via task GET.
+  ctx.waitUntil(processing);
+  await processing;
+  const task = await loadTranslationTask(env, user.id, taskID);
+  if (!task) return translatorError(env, "Translation task was not saved", 500, "PET_TRANSLATOR_500");
+  const response = await respondWithTranslationTask(request, env, task, 201);
+  return response;
+}
+
+export function parseRangeHeader(value: string | null, size: number): { offset: number; length: number } | null | "invalid" {
+  if (!value) return null;
+  const match = /^bytes=(\d*)-(\d*)$/.exec(value.trim());
+  if (!match) return "invalid";
+  const startText = match[1];
+  const endText = match[2];
+  if (!startText && !endText) return "invalid";
+  let offset: number;
+  let end: number;
+  if (!startText) {
+    const suffix = Number(endText);
+    if (!Number.isSafeInteger(suffix) || suffix <= 0) return "invalid";
+    offset = Math.max(0, size - suffix);
+    end = size - 1;
+  } else {
+    offset = Number(startText);
+    end = endText ? Number(endText) : size - 1;
+    if (!Number.isSafeInteger(offset) || !Number.isSafeInteger(end) || offset < 0 || end < offset || offset >= size) return "invalid";
+    end = Math.min(end, size - 1);
+  }
+  return { offset, length: end - offset + 1 };
+}
+
+async function handleTranslationAudio(request: Request, env: Env, taskID: string): Promise<Response> {
+  if (!env.JWT_SECRET?.trim() || env.JWT_SECRET.trim().length < 32) return translatorError(env, "Worker JWT_SECRET is not configured", 503, "CONFIGURATION_ERROR");
+  const token = new URL(request.url).searchParams.get("token") || "";
+  const task = await env.DB.prepare("SELECT t.*, u.deleted_at FROM pet_translation_tasks t JOIN users u ON u.id = t.user_id WHERE t.id = ? AND t.state = 'succeeded'")
+    .bind(taskID).first<PetTranslationTask & { deleted_at?: string | null }>();
+  if (!task || task.deleted_at) return translatorError(env, "Audio not found", 404, "NOT_FOUND");
+  const storageKey = await translationAudioStorageKey(env, task);
+  if (!storageKey) return translatorError(env, "Audio not found", 404, "NOT_FOUND");
+  if (Date.parse(task.expires_at) <= Date.now()) return translatorError(env, "Audio has expired", 410, "PET_TRANSLATOR_RESULT_EXPIRED");
+  if (!(await verifyAudioToken(env.JWT_SECRET.trim(), token, task.id, storageKey))) return translatorError(env, "Audio URL is invalid or expired", 401, "UNAUTHORIZED");
+  const head = await env.ASSETS.head(storageKey);
+  if (!head) return translatorError(env, "Audio not found", 404, "NOT_FOUND");
+  const range = parseRangeHeader(request.headers.get("Range"), head.size);
+  if (range === "invalid") return new Response(null, { status: 416, headers: { ...corsHeaders(env), "content-range": `bytes */${head.size}`, "accept-ranges": "bytes" } });
+  const headers: Record<string, string> = {
+    ...corsHeaders(env),
+    "content-type": "audio/mpeg",
+    "accept-ranges": "bytes",
+    "cache-control": "private, max-age=60",
+    "content-length": String(range ? range.length : head.size),
+    "content-disposition": "inline"
+  };
+  if (range) {
+    headers["content-range"] = `bytes ${range.offset}-${range.offset + range.length - 1}/${head.size}`;
+    if (request.method === "HEAD") return new Response(null, { status: 206, headers });
+    const object = await env.ASSETS.get(storageKey, { range });
+    if (!object) return translatorError(env, "Audio not found", 404, "NOT_FOUND");
+    return new Response(object.body, { status: 206, headers });
+  }
+  if (request.method === "HEAD") return new Response(null, { status: 200, headers });
+  const object = await env.ASSETS.get(storageKey);
+  if (!object) return translatorError(env, "Audio not found", 404, "NOT_FOUND");
+  return new Response(object.body, { status: 200, headers });
 }
 
 const REVENUECAT_PRODUCTS: Record<string, { points: number; reason: string }> = {
@@ -518,6 +1141,10 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
   if (path === "/healthz") return json({ ok: true, app: env.APP_NAME, timestamp: now() }, { headers: corsHeaders(env) });
   if (path === "/v1/webhooks/revenuecat" && request.method === "POST") return handleRevenueCatWebhook(request, env);
+  const translatorAudioMatch = path.match(/^\/v1\/pet-translator\/audio\/([^/]+)$/);
+  if (translatorAudioMatch && ["GET", "HEAD"].includes(request.method)) {
+    return handleTranslationAudio(request, env, translatorAudioMatch[1]);
+  }
   if (!env.JWT_SECRET || env.JWT_SECRET.trim().length < 32) return error("Worker JWT_SECRET is not configured", 503, "CONFIGURATION_ERROR");
   if (!(await verifyAppCheck(env, request))) return error("A valid Firebase App Check token is required", 401, "APP_CHECK_REQUIRED");
 
@@ -546,11 +1173,34 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
   const user = await userForRequest(request, env);
   if (!user) return error("Authentication required", 401, "UNAUTHORIZED");
 
+  if (path === "/v1/pet-translator/pet-to-human" && request.method === "POST") {
+    return handleTranslationRequest(request, env, user, "PET_TO_HUMAN", ctx);
+  }
+  if (path === "/v1/pet-translator/human-to-pet" && request.method === "POST") {
+    return handleTranslationRequest(request, env, user, "HUMAN_TO_PET", ctx);
+  }
+  const translatorTaskMatch = path.match(/^\/v1\/pet-translator\/tasks\/([^/]+)$/);
+  if (translatorTaskMatch && request.method === "GET") {
+    const task = await loadTranslationTask(env, user.id, translatorTaskMatch[1]);
+    if (!task) return translatorError(env, "Translation task not found", 404, "NOT_FOUND");
+    return respondWithTranslationTask(request, env, task);
+  }
+
   if (path === "/v1/me" && request.method === "GET") {
     return json({ id: user.id, customer_id: user.customer_id }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/me" && request.method === "DELETE") {
-    await env.DB.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(now(), now(), user.id).run();
+    const translationOutputs = await env.DB.prepare("SELECT output_key FROM pet_translation_tasks WHERE user_id = ? AND output_key IS NOT NULL")
+      .bind(user.id).all<{ output_key: string }>();
+    let outputsDeleted = true;
+    for (const row of translationOutputs.results || []) {
+      try { await env.ASSETS.delete(row.output_key); }
+      catch (cause) { outputsDeleted = false; console.error("Translation output cleanup failed", cause); }
+    }
+    const deletedAt = now();
+    await env.DB.prepare("UPDATE pet_translation_tasks SET state = 'expired', phase = 'expired', result_json = NULL, output_key = CASE WHEN ? = 1 THEN NULL ELSE output_key END, audio_source = 'none', sound_id = NULL, sound_library_version = NULL, sound_emotion = NULL, sound_intensity = NULL, sound_duration_seconds = NULL, expires_at = ?, updated_at = ? WHERE user_id = ?")
+      .bind(outputsDeleted ? 1 : 0, deletedAt, deletedAt, user.id).run();
+    await env.DB.prepare("UPDATE users SET deleted_at = ?, updated_at = ? WHERE id = ?").bind(deletedAt, deletedAt, user.id).run();
     return json({ ok: true }, { headers: corsHeaders(env) });
   }
   if (path === "/v1/wallet" && request.method === "GET") {
@@ -787,7 +1437,7 @@ async function handle(request: Request, env: Env, ctx: ExecutionContext): Promis
 }
 
 function corsHeaders(env: Env): Record<string, string> {
-  return { "access-control-allow-origin": env.CORS_ORIGINS || "*", "access-control-allow-headers": "Authorization, Content-Type, X-App-Attest, X-Firebase-AppCheck", "access-control-allow-methods": "GET, POST, PATCH, DELETE, OPTIONS" };
+  return { "access-control-allow-origin": env.CORS_ORIGINS || "*", "access-control-allow-headers": "Authorization, Content-Type, X-Request-ID, X-App-Attest, X-Firebase-AppCheck, Range", "access-control-allow-methods": "GET, HEAD, POST, PATCH, DELETE, OPTIONS", "access-control-expose-headers": "Content-Length, Content-Range, Accept-Ranges" };
 }
 function mediaURL(request: Request, key: string): string {
   return `${new URL(request.url).origin}/v1/media/${encodeURIComponent(key)}`;
@@ -931,6 +1581,96 @@ async function cleanupOrphanUploads(env: Env): Promise<void> {
   } while (cursor);
 }
 
+async function cleanupPetTranslationResults(env: Env): Promise<void> {
+  const cutoff = now();
+  const rows = await env.DB.prepare("SELECT id, output_key, audio_source FROM pet_translation_tasks WHERE expires_at <= ? AND (state != 'expired' OR output_key IS NOT NULL) LIMIT 500")
+    .bind(cutoff).all<{ id: string; output_key?: string | null; audio_source?: string | null }>();
+  for (const row of rows.results || []) {
+    let deleted = true;
+    if (row.output_key && row.audio_source !== "shared_library") {
+      try { await env.ASSETS.delete(row.output_key); }
+      catch (cause) { deleted = false; console.error("Pet translation result cleanup failed", { taskID: row.id, cause }); }
+    }
+    await env.DB.prepare("UPDATE pet_translation_tasks SET state = 'expired', phase = 'expired', result_json = NULL, output_key = CASE WHEN ? = 1 THEN NULL ELSE output_key END, audio_source = 'none', sound_id = NULL, sound_library_version = NULL, sound_emotion = NULL, sound_intensity = NULL, sound_duration_seconds = NULL, updated_at = ? WHERE id = ?")
+      .bind(deleted ? 1 : 0, now(), row.id).run();
+  }
+}
+
+async function cleanupOrphanTranslationOutputs(env: Env): Promise<void> {
+  const cutoff = Date.now() - translationResultTTLDays(env) * 24 * 60 * 60 * 1000;
+  let cursor: string | undefined;
+  do {
+    const listing = await env.ASSETS.list({ prefix: "users/", limit: 1000, ...(cursor ? { cursor } : {}) });
+    for (const object of listing.objects) {
+      if (!object.key.includes("/pet-translator/output/") || object.uploaded.getTime() >= cutoff) continue;
+      const referenced = await env.DB.prepare("SELECT id FROM pet_translation_tasks WHERE output_key = ? LIMIT 1").bind(object.key).first<{ id: string }>();
+      if (!referenced) await env.ASSETS.delete(object.key);
+    }
+    cursor = listing.truncated ? listing.cursor : undefined;
+  } while (cursor);
+}
+
+async function retryAllPendingRefunds(env: Env): Promise<void> {
+  const rows = await env.DB.prepare("SELECT DISTINCT user_id FROM pending_refunds WHERE status = 'pending' LIMIT 100")
+    .all<{ user_id: string }>();
+  for (const row of rows.results || []) {
+    // Refunds are billing recovery work and must continue after a soft account
+    // deletion; the customer record is still needed to reconcile RevenueCat.
+    const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE id = ?")
+      .bind(row.user_id).first<User>();
+    if (!user) continue;
+    await retryPendingRefunds(env, user);
+    const completed = await env.DB.prepare("SELECT reference FROM pending_refunds WHERE user_id = ? AND status = 'completed' AND reference LIKE 'pet-translator:%:refund'")
+      .bind(user.id).all<{ reference: string }>();
+    for (const row of completed.results || []) {
+      const taskID = row.reference.replace(/^pet-translator:(.*):refund$/, "$1");
+      await env.DB.prepare("UPDATE pet_translation_tasks SET state = CASE WHEN state = 'processing' THEN 'succeeded' ELSE state END, refund_status = 'completed', phase = CASE WHEN state IN ('processing', 'succeeded') THEN 'completed' ELSE phase END, updated_at = ? WHERE id = ? AND refund_status = 'pending'")
+        .bind(now(), taskID).run();
+    }
+  }
+}
+
+async function retryPendingTranslationTaskRefunds(env: Env): Promise<void> {
+  // The task row is a second durable recovery queue for the narrow case where
+  // a database interruption happened while creating pending_refunds.
+  const rows = await env.DB.prepare("SELECT * FROM pet_translation_tasks WHERE refund_status = 'pending' LIMIT 100").all<PetTranslationTask>();
+  for (const task of rows.results || []) {
+    const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE id = ?").bind(task.user_id).first<User>();
+    if (!user) continue;
+    const refund = await refundTranslationPoints(env, user, task.id, Number(task.credit_cost));
+    if (refund === "completed") {
+      await updateTranslationTask(env, task.id, {
+        state: task.state === "processing" ? "succeeded" : task.state,
+        phase: task.state === "processing" || task.state === "succeeded" ? "completed" : task.phase,
+        refund_status: "completed",
+        updated_at: now()
+      });
+    }
+  }
+}
+
+async function reconcileUnknownTranslationDebits(env: Env): Promise<void> {
+  const rows = await env.DB.prepare("SELECT * FROM pet_translation_tasks WHERE debit_status = 'unknown' AND refund_status = 'manual_review' LIMIT 100")
+    .all<PetTranslationTask>();
+  for (const task of rows.results || []) {
+    const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE id = ?")
+      .bind(task.user_id).first<User>();
+    if (!user) continue;
+    try {
+      // Reusing the original idempotency key either returns the already
+      // accepted debit or safely completes the one unresolved adjustment.
+      const providerBalance = await revenueCatAdjust(env, user.customer_id, -Number(task.credit_cost), task.debit_key);
+      if (providerBalance === null) continue;
+      await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, 'generation_debit', ?, ?)")
+        .bind(id(), user.id, user.customer_id, -Number(task.credit_cost), task.debit_key, now()).run();
+      const refund = await refundTranslationPoints(env, user, task.id, Number(task.credit_cost));
+      await updateTranslationTask(env, task.id, { debit_status: "confirmed", refund_status: refund === "completed" ? "completed" : "pending", phase: refund === "completed" ? "failed" : "refund_pending", updated_at: now() });
+    } catch (cause) {
+      console.error("Unknown pet translation debit reconciliation failed", { taskID: task.id, cause });
+    }
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
     try { return await handle(request, env, ctx); }
@@ -939,5 +1679,15 @@ export default {
   async scheduled(_controller: ScheduledController, env: Env, _ctx: ExecutionContext): Promise<void> {
     try { await cleanupOrphanUploads(env); }
     catch (cause) { console.error("Upload cleanup failed", cause); }
+    try { await cleanupPetTranslationResults(env); }
+    catch (cause) { console.error("Pet translation result cleanup failed", cause); }
+    try { await cleanupOrphanTranslationOutputs(env); }
+    catch (cause) { console.error("Pet translation orphan cleanup failed", cause); }
+    try { await retryAllPendingRefunds(env); }
+    catch (cause) { console.error("Pending refund reconciliation failed", cause); }
+    try { await retryPendingTranslationTaskRefunds(env); }
+    catch (cause) { console.error("Pet translation task refund recovery failed", cause); }
+    try { await reconcileUnknownTranslationDebits(env); }
+    catch (cause) { console.error("Unknown debit reconciliation failed", cause); }
   }
 };

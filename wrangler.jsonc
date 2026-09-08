@@ -36,6 +36,17 @@
     "VIDU_BASE_URL": "https://api.vidu.com",
     "VIDU_IMAGE_MODEL": "viduq2",
     "VIDU_VIDEO_MODEL": "viduq3-pro-fast",
+    "GEMINI_MODEL": "gemini-3.8-flash",
+    "GEMINI_BASE_URL": "https://generativelanguage.googleapis.com/v1beta",
+    "PET_TRANSLATOR_MAX_AUDIO_SECONDS": "15",
+    "PET_TRANSLATOR_MAX_FILE_MB": "10",
+    "PET_TRANSLATOR_RESULT_TTL_DAYS": "7",
+    "PET_TRANSLATOR_AUDIO_URL_TTL_SECONDS": "900",
+    "PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST": "",
+    "PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST": "",
+    "PET_TRANSLATOR_AUDIO_LIBRARY_READY": "false",
+    "PET_TRANSLATOR_SOUND_LIBRARY_VERSION": "v1",
+    "PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED": "80",
     "CORS_ORIGINS": ""
   },
   "observability": { "enabled": true }

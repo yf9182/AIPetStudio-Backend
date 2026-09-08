@@ -2,3 +2,11 @@
 JWT_SECRET=replace-with-a-long-random-secret
 REVENUECAT_SECRET_KEY=replace-with-revenuecat-v2-secret
 VIDU_API_KEY=replace-with-vidu-api-key
+# The translator is disabled until both credit prices and provider secrets are set.
+GEMINI_API_KEY=replace-with-gemini-api-key
+PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST=10
+PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST=20
+# Keep false until the imported sound manifest has been reviewed in D1.
+PET_TRANSLATOR_AUDIO_LIBRARY_READY=false
+PET_TRANSLATOR_SOUND_LIBRARY_VERSION=v1
+PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED=80
