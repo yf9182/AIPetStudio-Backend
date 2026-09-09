@@ -654,11 +654,24 @@ async function expireTranslationTaskIfNeeded(env: Env, task: PetTranslationTask)
   };
 }
 
-async function respondWithTranslationTask(request: Request, env: Env, task: PetTranslationTask, status = 200): Promise<Response> {
+async function respondWithTranslationTask(
+  request: Request,
+  env: Env,
+  task: PetTranslationTask,
+  status = 200,
+  options: { requireSettled?: boolean } = {}
+): Promise<Response> {
   task = await expireTranslationTaskIfNeeded(env, task);
   if (task.state === "expired") return translationErrorWithTask(env, task.id, task.state, "PET_TRANSLATOR_RESULT_EXPIRED", "translation result has expired", 410);
+  const refundPending = ["pending", "manual_review"].includes(String(task.refund_status || "").toLowerCase());
+  if (options.requireSettled && refundPending) {
+    return translationErrorWithTask(env, task.id, task.state, "PET_TRANSLATOR_PENDING", "translation is still being finalized", 503);
+  }
   if (task.state === "failed") {
     return translationErrorWithTask(env, task.id, task.state, task.error_code || "PET_TRANSLATOR_500", task.error_message || "translation failed", translationFailureStatus(task.error_code || null));
+  }
+  if (options.requireSettled && task.state !== "succeeded") {
+    return translationErrorWithTask(env, task.id, task.state, "PET_TRANSLATOR_PENDING", "translation is still processing", 503);
   }
   return json(translationEnvelope(await translationData(request, env, task)), { status, headers: { ...corsHeaders(env), "cache-control": "no-store" } });
 }
@@ -889,7 +902,7 @@ async function handleTranslationRequest(request: Request, env: Env, user: User, 
   const existing = await loadTranslationTaskByRequest(env, user.id, input.requestID);
   if (existing) {
     if (existing.request_fingerprint !== input.fingerprint) return translatorError(env, "X-Request-ID was already used for different audio", 409, "IDEMPOTENCY_KEY_REUSED");
-    return respondWithTranslationTask(request, env, existing);
+    return respondWithTranslationTask(request, env, existing, 200, { requireSettled: true });
   }
   const config = translationConfig(env, direction);
   if (!config.enabled) return translatorError(env, "Pet translator is temporarily unavailable", 503, "PET_TRANSLATOR_NOT_CONFIGURED");
@@ -916,19 +929,20 @@ async function handleTranslationRequest(request: Request, env: Env, user: User, 
     const raced = await loadTranslationTaskByRequest(env, user.id, input.requestID);
     if (raced) {
       if (raced.request_fingerprint !== input.fingerprint) return translatorError(env, "X-Request-ID was already used for different audio", 409, "IDEMPOTENCY_KEY_REUSED");
-      return respondWithTranslationTask(request, env, raced);
+      return respondWithTranslationTask(request, env, raced, 200, { requireSettled: true });
     }
     if (String(cause).toLowerCase().includes("unique")) return translatorError(env, "A translation is already processing", 409, "PET_TRANSLATOR_BUSY");
     throw cause;
   }
   const processing = processTranslationTask(env, taskID, user, input, direction, config.cost, ctx, deadline);
   // Keep the persisted task progressing if the client disconnects while the
-  // provider calls are still in flight; the caller can recover via task GET.
+  // provider calls are still in flight; operators can inspect the task once
+  // the request has returned or the client has lost connectivity.
   ctx.waitUntil(processing);
   await processing;
   const task = await loadTranslationTask(env, user.id, taskID);
   if (!task) return translatorError(env, "Translation task was not saved", 500, "PET_TRANSLATOR_500");
-  const response = await respondWithTranslationTask(request, env, task, 201);
+  const response = await respondWithTranslationTask(request, env, task, 201, { requireSettled: true });
   return response;
 }
 

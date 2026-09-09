@@ -5,7 +5,7 @@ VIDU_API_KEY=replace-with-vidu-api-key
 # The translator is disabled until both credit prices and provider secrets are set.
 GEMINI_API_KEY=replace-with-gemini-api-key
 PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST=10
-PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST=20
+PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST=10
 # Keep false until the imported sound manifest has been reviewed in D1.
 PET_TRANSLATOR_AUDIO_LIBRARY_READY=false
 PET_TRANSLATOR_SOUND_LIBRARY_VERSION=v1

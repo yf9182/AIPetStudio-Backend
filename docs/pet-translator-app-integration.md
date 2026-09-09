@@ -73,7 +73,7 @@ Content-Type: multipart/form-data; boundary=...
 | --- | --- | --- |
 | 宠物→人 | `POST /v1/pet-translator/pet-to-human` | 识别宠物叫声，返回情绪、意图和拟人化表达 |
 | 人→宠物 | `POST /v1/pet-translator/human-to-pet` | 识别人声含义和情绪，返回匹配的预置猫狗录音 |
-| 查询任务 | `GET /v1/pet-translator/tasks/{task_id}` | 断线恢复、处理状态查询和刷新 `audio_url` |
+| 查询任务 | `GET /v1/pet-translator/tasks/{task_id}` | 一次性查看任务或刷新 `audio_url`；不做定时轮询 |
 | 播放音频 | `GET /v1/pet-translator/audio/{task_id}?token=...` | 使用响应中的 `audio_url`，支持 Range |
 
 表单字段只能使用以下三个字段：
@@ -101,7 +101,7 @@ curl -X POST "$WORKER/v1/pet-translator/human-to-pet" \
 
 成功响应沿用 Worker 的 `code/message/data` 包装：
 
-新任务完成时 POST 通常返回 HTTP `201`；使用同一个请求 ID 重试并复用已保存结果时返回 HTTP `200`。客户端应将两者都视为成功，不要根据状态码重新创建任务。
+新任务完成时 POST 返回 HTTP `201`，且 `data.state` 必须是 `succeeded`；使用同一个请求 ID 重试并复用已保存结果时返回 HTTP `200`，且同样只返回终态。客户端应将两者都视为成功，不要根据状态码重新创建任务。
 
 ```json
 {
@@ -125,7 +125,7 @@ curl -X POST "$WORKER/v1/pet-translator/human-to-pet" \
     "sound_intensity": "medium",
     "audio_duration_seconds": 4.2,
     "sound_library_version": "v1",
-    "credit_cost": 20,
+    "credit_cost": 10,
     "debit_status": "confirmed",
     "refund_status": "none",
     "created_at": "2026-09-08T03:00:00.000Z",
@@ -159,7 +159,7 @@ curl -X POST "$WORKER/v1/pet-translator/human-to-pet" \
 
 客户端只播放服务端返回的 `audio_url`。声音库中的产品标签是娱乐映射，不是动物情绪的科学定论。
 
-## 5. 无效声音、处理中和重试
+## 5. 无效声音、失败和重试
 
 ### 无有效人声或宠物声
 
@@ -175,18 +175,18 @@ curl -X POST "$WORKER/v1/pet-translator/human-to-pet" \
 }
 ```
 
-如果 `refund_status` 为 `pending`，任务会暂时保持 `processing`，客户端继续查询任务，不应再次创建请求或自行修改余额。最终净扣费为零。
+如果 `refund_status` 为 `pending`，同步 POST 返回 `503 PET_TRANSLATOR_PENDING` 和 `task_id`。客户端不自动查询或创建新任务；用户稍后手动重新提交时必须复用原 `X-Request-ID`，服务端会按幂等记录继续返回结果或待处理状态。最终净扣费为零。
 
-### 断线恢复和查询
+### 同步提交、断线和查询
 
-POST 返回前 App 可能断网、被杀进程或超时。每次任务创建后保存 `task_id`；回前台、冷启动或请求超时后调用：
+POST 会在服务端完成扣费、Gemini 分析、声音匹配和退款结算后返回，最长等待约 60 秒。App 可能在响应返回前断网、被杀进程或超时；这种情况下不会自动恢复结果。客户端应保留原录音和 `X-Request-ID`，让用户手动重新提交：
 
-```http
-GET /v1/pet-translator/tasks/{task_id}
-Authorization: Bearer <access_token>
+```text
+使用同一个 X-Request-ID 再次 POST 同一段录音
+不要生成新的请求 ID 来重放同一段录音
 ```
 
-建议轮询间隔为 0.5 秒、1 秒、2 秒、4 秒，之后每 4 秒一次；收到终态后停止。重复查询不消耗生成次数，也不会重复扣费。相同请求的 POST 重试必须继续使用原 `X-Request-ID`。
+`GET /v1/pet-translator/tasks/{task_id}` 仅用于一次性查看任务或刷新人声转宠物的签名音频地址，不作为定时轮询接口。重复查询不消耗生成次数，也不会重复扣费。
 
 如果返回 `409 IDEMPOTENCY_KEY_REUSED`，说明同一用户已经用这个请求 ID 提交了不同内容；放弃该 ID，重新录音并生成新的 UUID。不要用新 ID 重放同一录音来规避未知状态。
 
@@ -326,7 +326,7 @@ request.setValue(token.token, forHTTPHeaderField: "X-Firebase-AppCheck")
 | `401 UNAUTHORIZED` | refresh 一次，失败后 bootstrap，再用原请求 ID 重试 |
 | `401 APP_CHECK_REQUIRED` | 刷新 App Check token 后重试 |
 | `402 PET_TRANSLATOR_101` | 打开积分不足界面，不重复上传 |
-| `409 PET_TRANSLATOR_BUSY` | 显示已有任务处理中，查询已有任务 |
+| `409 PET_TRANSLATOR_BUSY` | 显示已有任务处理中，不自动轮询 |
 | `409 IDEMPOTENCY_KEY_REUSED` | 丢弃该请求 ID，重新录音并生成新 UUID |
 | `413 PET_TRANSLATOR_002` | 提示录音过大 |
 | `415 PET_TRANSLATOR_004` | 提示文件格式或音轨无法解析 |
@@ -334,10 +334,13 @@ request.setValue(token.token, forHTTPHeaderField: "X-Firebase-AppCheck")
 | `422 PET_TRANSLATOR_005/006/007/008` | 修正物种、语言、请求 ID 或表单字段 |
 | `429 PET_TRANSLATOR_RATE_LIMITED` | 稍后重试；查询任务不受生成额度影响 |
 | `503 PET_TRANSLATOR_NOT_CONFIGURED` | 显示服务暂不可用，不自动重试提交 |
+| `503 PET_TRANSLATOR_PENDING` | 任务或退款尚未完成；保留原请求 ID，等待用户手动重新提交 |
 | `503 PET_TRANSLATOR_SOUND_LIBRARY_NOT_READY` | 人→宠物素材库尚未开放，显示暂不可用 |
-| `502 PET_TRANSLATOR_SOUND_UNAVAILABLE` | 无该情绪的审核素材，等待服务退款结果 |
-| `502 PET_TRANSLATOR_202` | 模型结果不可解析，等待退款结果，不重放同一任务 |
-| `504 PET_TRANSLATOR_TIMEOUT` | 保存任务 ID，转为查询流程 |
+| `503 PET_TRANSLATOR_201/POINTS_PROVIDER_ERROR` | 服务或积分供应商失败；若响应带 `task_id` 则视为终态失败，重新录制 |
+| `502 PET_TRANSLATOR_SOUND_UNAVAILABLE` | 无该情绪的审核素材；显示失败，可重新录音，退款由服务端处理 |
+| `502 PET_TRANSLATOR_202` | 模型结果不可解析；显示失败，可重新录音，退款由服务端处理 |
+| `502 PET_TRANSLATOR_500` | 翻译任务异常结束；显示失败，可重新录音 |
+| `504 PET_TRANSLATOR_TIMEOUT` | 保留原请求 ID，等待用户手动重新提交 |
 | `410 PET_TRANSLATOR_RESULT_EXPIRED` | 清理本地恢复状态，提示重新录音 |
 
 录音内容只作为输入数据分析，不能把录音中的指令当成 App 指令。不要在日志中记录录音字节、完整转写或签名 URL。
@@ -350,6 +353,6 @@ request.setValue(token.token, forHTTPHeaderField: "X-Firebase-AppCheck")
 - 验证同一请求 ID 换录音返回 409，跨用户不能查询或播放任务。
 - 验证人→宠物成功返回 `audio_url` 和声音元数据，且客户端不调用任何音效生成服务。
 - 验证无有效人声、目标情绪没有可用素材时没有音频，积分最终退款。
-- 验证 App 进入后台、断网、进程重启后可以通过 `task_id` 恢复。
+- 验证 App 进入后台、断网、进程重启后不会自动查询；用户可用原 `X-Request-ID` 手动重新提交，播放失败时才单次刷新 `audio_url`。
 - 验证 AVPlayer 的 Range 播放、签名地址刷新、地址过期和任务过期。
 - Release 环境验证 App Check required；Debug 环境使用 Firebase App Check Debug provider。

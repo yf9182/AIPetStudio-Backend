@@ -62,14 +62,16 @@ POST /v1/pet-translator/human-to-pet
 
 Each request contains `audio`, `species` (`cat` or `dog`) and optional `language` (currently `zh-CN`), plus a UUID `X-Request-ID` header. Audio is inspected from its container/frame headers and is limited to 10 MiB and 15 seconds. Supported formats are WAV, MP3, ADTS AAC and M4A/MP4 audio. The original recording is never stored in R2.
 
-Pet-to-human uses Gemini structured JSON output for a conservative emotional interpretation. Human-to-pet uses Gemini to transcribe and classify the recorded human message, then selects one reviewed recording from the versioned cat/dog sound library. It never calls a speech or sound generation provider. The selected recording is stored under a private, shared R2 library key and returned through a short-lived task-scoped signed URL. `GET /v1/pet-translator/tasks/{task_id}` refreshes a result, and the signed audio route supports HTTP Range requests for AVPlayer.
+Pet-to-human uses Gemini structured JSON output for a conservative emotional interpretation. Human-to-pet uses Gemini to transcribe and classify the recorded human message, then selects one reviewed recording from the versioned cat/dog sound library. It never calls a speech or sound generation provider. The selected recording is stored under a private, shared R2 library key and returned through a short-lived task-scoped signed URL. Translation POST requests wait synchronously for a final result (up to 60 seconds): a new successful task returns `201` with `data.state=succeeded`, and an idempotent replay of an already settled result returns `200`. Normal success never requires polling; `GET /v1/pet-translator/tasks/{task_id}` is retained for one-time result inspection, signed audio URL refresh and manual investigation, and the signed audio route supports HTTP Range requests for AVPlayer.
 
-Translator pricing and provider secrets are deliberately unset in `wrangler.jsonc`; set the following as Worker variables/secrets before enabling an endpoint:
+If the app loses connectivity, is killed or times out before receiving the POST response, it does not automatically recover by querying the task. Keep the original recording and reuse the same `X-Request-ID` for a user-initiated resubmission; do not create a second request ID for the same recording. `503 PET_TRANSLATOR_PENDING` with a `task_id` means the task or its refund is still being finalized, so do not create another task or charge the user.
+
+Translator pricing is configured in `wrangler.jsonc`; set the provider secret and keep the following variables aligned before enabling an endpoint:
 
 ```env
 GEMINI_API_KEY=<Worker secret>
 PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST=10
-PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST=20
+PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST=10
 PET_TRANSLATOR_AUDIO_LIBRARY_READY=true
 PET_TRANSLATOR_SOUND_LIBRARY_VERSION=v1
 PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED=80

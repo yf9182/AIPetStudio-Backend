@@ -300,7 +300,7 @@ try {
       async put(key, value) { state.output.set(key, new Uint8Array(value)); },
       async delete(key) { state.output.delete(key); }
     };
-    const env = { DB: db, ASSETS: assets, APP_NAME: "AI Pet Studio", JWT_SECRET: "translator-test-jwt-secret-012345678901", ACCESS_TOKEN_TTL_SECONDS: "3600", APP_ATTEST_MODE: "disabled", REVENUECAT_PROJECT_ID: "project", REVENUECAT_VIRTUAL_CURRENCY_CODE: "PTS", REVENUECAT_API_BASE_URL: "https://revenuecat.test", REVENUECAT_SECRET_KEY: "rc-secret", GEMINI_API_KEY: "gemini-secret", GEMINI_BASE_URL: "https://gemini.test/v1beta", PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST: "10", PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST: "20", PET_TRANSLATOR_AUDIO_LIBRARY_READY: "true", PET_TRANSLATOR_SOUND_LIBRARY_VERSION: "v1", PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED: "1" };
+    const env = { DB: db, ASSETS: assets, APP_NAME: "AI Pet Studio", JWT_SECRET: "translator-test-jwt-secret-012345678901", ACCESS_TOKEN_TTL_SECONDS: "3600", APP_ATTEST_MODE: "disabled", REVENUECAT_PROJECT_ID: "project", REVENUECAT_VIRTUAL_CURRENCY_CODE: "PTS", REVENUECAT_API_BASE_URL: "https://revenuecat.test", REVENUECAT_SECRET_KEY: "rc-secret", GEMINI_API_KEY: "gemini-secret", GEMINI_BASE_URL: "https://gemini.test/v1beta", PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST: "10", PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST: "10", PET_TRANSLATOR_AUDIO_LIBRARY_READY: "true", PET_TRANSLATOR_SOUND_LIBRARY_VERSION: "v1", PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED: "1" };
     const originalFetch = globalThis.fetch;
     globalThis.fetch = async (input, init) => {
       const url = String(input);
@@ -331,16 +331,34 @@ try {
       const petResponse = await worker.default.fetch(makeRequest("/v1/pet-translator/pet-to-human", petRequestID, wavBytes(1)), env, context);
       assert.equal(petResponse.status, 201);
       const petBody = await petResponse.json();
+      assert.equal(petBody.data.state, "succeeded");
       assert.equal(petBody.data.translation, "看看我嘛");
       assert.equal(state.geminiCalls, 1);
       const repeated = await worker.default.fetch(makeRequest("/v1/pet-translator/pet-to-human", petRequestID, wavBytes(1)), env, context);
       assert.equal(repeated.status, 200);
+      assert.equal((await repeated.clone().json()).data.state, "succeeded");
       assert.equal(state.geminiCalls, 1);
+      const existingTask = state.tasks.find(task => task.request_id === petRequestID);
+      existingTask.state = "processing";
+      const pendingResponse = await worker.default.fetch(makeRequest("/v1/pet-translator/pet-to-human", petRequestID, wavBytes(1)), env, context);
+      assert.equal(pendingResponse.status, 503);
+      const pendingBody = await pendingResponse.json();
+      assert.equal(pendingBody.error.code, "PET_TRANSLATOR_PENDING");
+      assert.equal(pendingBody.data.task_id, existingTask.id);
+      existingTask.state = "succeeded";
+      existingTask.refund_status = "pending";
+      const refundPendingResponse = await worker.default.fetch(makeRequest("/v1/pet-translator/pet-to-human", petRequestID, wavBytes(1)), env, context);
+      assert.equal(refundPendingResponse.status, 503);
+      const refundPendingBody = await refundPendingResponse.json();
+      assert.equal(refundPendingBody.error.code, "PET_TRANSLATOR_PENDING");
+      assert.equal(refundPendingBody.data.task_id, existingTask.id);
+      existingTask.refund_status = "none";
       const conflict = await worker.default.fetch(makeRequest("/v1/pet-translator/pet-to-human", petRequestID, wavBytes(1, 16000)), env, context);
       assert.equal(conflict.status, 409);
       const humanResponse = await worker.default.fetch(makeRequest("/v1/pet-translator/human-to-pet", "550e8400-e29b-41d4-a716-446655440002", wavBytes(1)), env, context);
       assert.equal(humanResponse.status, 201);
       const humanBody = await humanResponse.json();
+      assert.equal(humanBody.data.state, "succeeded");
       assert.match(humanBody.data.audio_url, /pet-translator\/audio/);
       assert.equal(humanBody.data.sound_id, "cat-happy-01");
       assert.equal(humanBody.data.sound_library_version, "v1");
@@ -405,7 +423,7 @@ try {
   });
 
   await test("disables translation when price or required provider is missing", () => {
-    const base = { PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST: "10", PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST: "20", REVENUECAT_SECRET_KEY: "rc", GEMINI_API_KEY: "gemini", PET_TRANSLATOR_AUDIO_LIBRARY_READY: "true" };
+    const base = { PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST: "10", PET_TRANSLATOR_HUMAN_TO_PET_CREDIT_COST: "10", REVENUECAT_SECRET_KEY: "rc", GEMINI_API_KEY: "gemini", PET_TRANSLATOR_AUDIO_LIBRARY_READY: "true" };
     assert.equal(translator.translationConfig({ ...base, PET_TRANSLATOR_PET_TO_HUMAN_CREDIT_COST: "" }, "PET_TO_HUMAN").enabled, false);
     assert.equal(translator.translationConfig({ ...base, PET_TRANSLATOR_AUDIO_LIBRARY_READY: "false" }, "HUMAN_TO_PET").enabled, false);
     assert.equal(translator.translationConfig({ ...base, PET_TRANSLATOR_AUDIO_LIBRARY_READY: "true" }, "HUMAN_TO_PET").enabled, true);
