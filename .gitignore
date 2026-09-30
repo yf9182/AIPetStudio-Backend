@@ -1,3 +1,9 @@
 node_modules/
 .wrangler/
 dist/
+
+# Local secrets. Never commit: .dev.vars holds the Cloudflare API token and
+# provider keys.
+.dev.vars
+.dev.vars.*
+!.dev.vars.example

@@ -58,6 +58,10 @@ export interface Env {
   PET_TRANSLATOR_AUDIO_LIBRARY_READY?: string;
   PET_TRANSLATOR_SOUND_LIBRARY_VERSION?: string;
   PET_TRANSLATOR_SOUND_LIBRARY_MIN_APPROVED?: string;
+  /** Stripe secret key. Only needed for the web purchase webhook and customer creation. */
+  STRIPE_SECRET_KEY?: string;
+  /** Signing secret of the Stripe webhook endpoint (`whsec_...`). */
+  STRIPE_WEBHOOK_SECRET?: string;
 }
 
 export type User = { id: string; customer_id: string; device_id: string; welcome_bonus_granted_at?: string | null };
@@ -1149,12 +1153,263 @@ async function handleRevenueCatWebhook(request: Request, env: Env): Promise<Resp
   return json({ ok: true, duplicate: Number(recorded.meta?.changes || 0) === 0 });
 }
 
+// ---------------------------------------------------------------------------
+// Stripe (web purchases)
+//
+// The RevenueCat webhook above only accepts `in_app_purchase` events, so a
+// purchase made in the browser can never be credited through it. Web purchases
+// are therefore settled here instead, against the same RevenueCat virtual
+// currency and the same `credit_ledger`, so a web buyer and an App Store buyer
+// end up with identical wallet state.
+//
+// Signatures are verified with WebCrypto rather than the Stripe SDK: this
+// Worker intentionally has no runtime dependencies.
+// ---------------------------------------------------------------------------
+
+type StripeSignatureHeader = { timestamp: number; signatures: string[] };
+
+/** Stripe sends `t=<unix>,v1=<hex hmac>,v1=<hex hmac>`. */
+export function parseStripeSignature(header: string | null): StripeSignatureHeader | null {
+  if (!header) return null;
+  let timestamp = 0;
+  const signatures: string[] = [];
+  for (const part of header.split(",")) {
+    const separator = part.indexOf("=");
+    if (separator === -1) continue;
+    const key = part.slice(0, separator).trim();
+    const value = part.slice(separator + 1).trim();
+    if (!key || !value) continue;
+    if (key === "t") timestamp = Number(value);
+    else if (key === "v1") signatures.push(value);
+  }
+  if (!Number.isSafeInteger(timestamp) || timestamp <= 0 || signatures.length === 0) return null;
+  return { timestamp, signatures };
+}
+
+function fromHex(value: string): Uint8Array | null {
+  if (value.length % 2 !== 0 || !/^[0-9a-f]+$/i.test(value)) return null;
+  const bytes = new Uint8Array(value.length / 2);
+  for (let index = 0; index < bytes.length; index += 1) {
+    bytes[index] = Number.parseInt(value.slice(index * 2, index * 2 + 2), 16);
+  }
+  return bytes;
+}
+
+/** Stripe's documented replay tolerance. */
+const STRIPE_SIGNATURE_TOLERANCE_SECONDS = 300;
+
+export async function verifyStripeSignature(env: Pick<Env, "STRIPE_WEBHOOK_SECRET">, payload: string, header: string | null): Promise<boolean> {
+  const secret = env.STRIPE_WEBHOOK_SECRET?.trim();
+  if (!secret) return false;
+  const parsed = parseStripeSignature(header);
+  if (!parsed) return false;
+  if (Math.abs(Math.floor(Date.now() / 1000) - parsed.timestamp) > STRIPE_SIGNATURE_TOLERANCE_SECONDS) return false;
+
+  const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["verify"]);
+  const signed = new TextEncoder().encode(`${parsed.timestamp}.${payload}`);
+  for (const signature of parsed.signatures) {
+    const bytes = fromHex(signature);
+    if (!bytes) continue;
+    if (await crypto.subtle.verify("HMAC", key, bytes as unknown as BufferSource, signed)) return true;
+  }
+  return false;
+}
+
+/**
+ * Reads the credit grant out of the metadata attached by the web client.
+ *
+ * Credits always come from Stripe metadata that the server itself wrote when it
+ * created the Checkout Session, never from anything the browser can edit later.
+ */
+function stripeGrantFromMetadata(metadata: unknown): { customerID: string; credits: number; reason: string } | null {
+  if (!metadata || typeof metadata !== "object") return null;
+  const fields = metadata as Record<string, unknown>;
+  const customerID = String(fields.aipet_customer_id || "").trim();
+  const credits = Number(fields.credits);
+  const kind = String(fields.product_kind || "");
+  if (!customerID || !Number.isSafeInteger(credits) || credits <= 0) return null;
+  return {
+    customerID,
+    credits,
+    reason: kind === "plan" ? "stripe_subscription" : "stripe_purchase"
+  };
+}
+
+/**
+ * Creates the RevenueCat customer when it does not exist yet.
+ *
+ * `revenueCatAdjust` treats a 404 as "customer missing" and returns null, which
+ * would silently drop a paid grant. Web buyers never run the RevenueCat SDK, so
+ * the customer is created explicitly before the first adjustment.
+ */
+async function ensureRevenueCatCustomer(env: Env, customerID: string): Promise<boolean> {
+  if (!env.REVENUECAT_SECRET_KEY) return false;
+  try {
+    const response = await fetch(`${env.REVENUECAT_API_BASE_URL}/v2/projects/${encodeURIComponent(env.REVENUECAT_PROJECT_ID)}/customers`, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${env.REVENUECAT_SECRET_KEY}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ id: customerID })
+    });
+    // 201 created; 409 means it already exists, which is equally fine.
+    return response.ok || response.status === 409;
+  } catch (cause) {
+    console.error("RevenueCat customer creation failed", cause);
+    return false;
+  }
+}
+
+/**
+ * Credits one Stripe purchase.
+ *
+ * Returns false when the grant could not be applied yet, which leaves the event
+ * `pending` for the cron to retry. The ledger reference makes replays safe.
+ */
+async function grantStripePoints(env: Env, user: User, credits: number, reason: string, reference: string): Promise<boolean> {
+  const already = await env.DB.prepare("SELECT id FROM credit_ledger WHERE reference = ?").bind(reference).first<{ id: string }>();
+  if (already) return true;
+
+  await ensureRevenueCatCustomer(env, user.customer_id);
+  const providerBalance = await revenueCatAdjust(env, user.customer_id, credits, reference);
+  if (providerBalance === null) return false;
+
+  await env.DB.prepare("INSERT OR IGNORE INTO credit_ledger(id, user_id, customer_id, amount, reason, reference, created_at) VALUES(?, ?, ?, ?, ?, ?, ?)")
+    .bind(id(), user.id, user.customer_id, credits, reason, reference, now())
+    .run();
+  return true;
+}
+
+async function applyStripeGrant(
+  env: Env,
+  event: { eventID: string; eventType: string; reference: string; customerID: string; credits: number; reason: string }
+): Promise<"completed" | "pending" | "duplicate"> {
+  const recorded = await env.DB.prepare("INSERT OR IGNORE INTO stripe_webhook_events(id, event_id, event_type, customer_id, amount, reference, status, attempts, created_at, updated_at) VALUES(?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)")
+    .bind(id(), event.eventID, event.eventType, event.customerID, event.credits, event.reference, now(), now())
+    .run();
+  if (Number(recorded.meta?.changes || 0) === 0) return "duplicate";
+
+  const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE deleted_at IS NULL AND customer_id = ?")
+    .bind(event.customerID)
+    .first<User>();
+
+  // The browser normally bootstraps before paying, but a purchase can land
+  // first; leave it pending rather than dropping a paid grant.
+  if (!user) return "pending";
+
+  try {
+    const granted = await grantStripePoints(env, user, event.credits, event.reason, event.reference);
+    if (!granted) return "pending";
+    await env.DB.prepare("UPDATE stripe_webhook_events SET status = 'completed', attempts = attempts + 1, last_error = NULL, updated_at = ? WHERE event_id = ?")
+      .bind(now(), event.eventID).run();
+    return "completed";
+  } catch (cause) {
+    await env.DB.prepare("UPDATE stripe_webhook_events SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE event_id = ?")
+      .bind(String(cause instanceof Error ? cause.message : cause).slice(0, 500), now(), event.eventID).run();
+    return "pending";
+  }
+}
+
+/** Retries grants that could not be applied when the event arrived. */
+async function retryPendingStripeGrants(env: Env): Promise<void> {
+  if (!env.STRIPE_WEBHOOK_SECRET) return;
+  const rows = await env.DB.prepare("SELECT event_id, customer_id, amount, reference, event_type FROM stripe_webhook_events WHERE status = 'pending' ORDER BY updated_at LIMIT 10")
+    .all<{ event_id: string; customer_id: string; amount: number; reference: string; event_type: string }>();
+
+  for (const row of rows.results || []) {
+    const reason = row.event_type === "invoice.paid" ? "stripe_subscription" : "stripe_purchase";
+
+    const user = await env.DB.prepare("SELECT id, customer_id, device_id, welcome_bonus_granted_at FROM users WHERE deleted_at IS NULL AND customer_id = ?")
+      .bind(row.customer_id).first<User>();
+    if (!user) continue;
+
+    try {
+      const granted = await grantStripePoints(env, user, row.amount, reason, row.reference);
+      if (!granted) {
+        await env.DB.prepare("UPDATE stripe_webhook_events SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE event_id = ?")
+          .bind("RevenueCat customer is still unavailable", now(), row.event_id).run();
+        continue;
+      }
+      await env.DB.prepare("UPDATE stripe_webhook_events SET status = 'completed', attempts = attempts + 1, last_error = NULL, updated_at = ? WHERE event_id = ?")
+        .bind(now(), row.event_id).run();
+    } catch (cause) {
+      await env.DB.prepare("UPDATE stripe_webhook_events SET attempts = attempts + 1, last_error = ?, updated_at = ? WHERE event_id = ?")
+        .bind(String(cause instanceof Error ? cause.message : cause).slice(0, 500), now(), row.event_id).run();
+    }
+  }
+}
+
+async function handleStripeWebhook(request: Request, env: Env): Promise<Response> {
+  if (!env.STRIPE_WEBHOOK_SECRET?.trim()) return error("Webhook is not configured", 503, "CONFIGURATION_ERROR");
+  const rawBody = await request.text();
+  if (!(await verifyStripeSignature(env, rawBody, request.headers.get("stripe-signature")))) {
+    return error("Invalid Stripe webhook signature", 401, "INVALID_SIGNATURE");
+  }
+
+  let event: { id?: string; type?: string; data?: { object?: Record<string, any> } };
+  try { event = JSON.parse(rawBody) as typeof event; }
+  catch { return error("Invalid webhook body", 422, "INVALID_BODY"); }
+
+  const eventID = String(event.id || "").trim();
+  const eventType = String(event.type || "");
+  if (!eventID) return error("Webhook event id is missing", 422, "INVALID_BODY");
+
+  const object = event.data?.object || {};
+
+  if (eventType === "checkout.session.completed") {
+    // Subscriptions grant on `invoice.paid` instead, otherwise the first
+    // invoice would be credited twice.
+    if (String(object.mode || "") !== "payment") return json({ ok: true, ignored: true });
+    const grant = stripeGrantFromMetadata(object.metadata);
+    const sessionID = String(object.id || "").trim();
+    if (!grant || !sessionID) {
+      console.warn("Stripe webhook ignored: checkout session is missing credit metadata");
+      return json({ ok: true, ignored: true });
+    }
+    const result = await applyStripeGrant(env, {
+      eventID,
+      eventType,
+      reference: `stripe:session:${sessionID}`,
+      ...grant
+    });
+    return json({ ok: true, result });
+  }
+
+  if (eventType === "invoice.paid") {
+    const invoiceID = String(object.id || "").trim();
+    // Metadata location varies across Stripe API versions; check every place
+    // the web client's session metadata can surface.
+    const grant =
+      stripeGrantFromMetadata(object.parent?.subscription_details?.metadata) ||
+      stripeGrantFromMetadata(object.subscription_details?.metadata) ||
+      stripeGrantFromMetadata(object.metadata) ||
+      stripeGrantFromMetadata(object.lines?.data?.[0]?.metadata);
+    if (!grant || !invoiceID) {
+      console.warn("Stripe webhook ignored: invoice is missing credit metadata");
+      return json({ ok: true, ignored: true });
+    }
+    const result = await applyStripeGrant(env, {
+      eventID,
+      eventType,
+      reference: `stripe:invoice:${invoiceID}`,
+      ...grant
+    });
+    return json({ ok: true, result });
+  }
+
+  // Refunds and failed payments are recorded by Stripe itself and reconciled
+  // manually for now; the wallet is never debited automatically here.
+  return json({ ok: true, ignored: true });
+}
+
 async function handle(request: Request, env: Env, ctx: ExecutionContext): Promise<Response> {
   const url = new URL(request.url);
   const path = url.pathname.replace(/\/$/, "") || "/";
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(env) });
   if (path === "/healthz") return json({ ok: true, app: env.APP_NAME, timestamp: now() }, { headers: corsHeaders(env) });
   if (path === "/v1/webhooks/revenuecat" && request.method === "POST") return handleRevenueCatWebhook(request, env);
+  if (path === "/v1/webhooks/stripe" && request.method === "POST") return handleStripeWebhook(request, env);
   const translatorAudioMatch = path.match(/^\/v1\/pet-translator\/audio\/([^/]+)$/);
   if (translatorAudioMatch && ["GET", "HEAD"].includes(request.method)) {
     return handleTranslationAudio(request, env, translatorAudioMatch[1]);
@@ -1703,5 +1958,7 @@ export default {
     catch (cause) { console.error("Pet translation task refund recovery failed", cause); }
     try { await reconcileUnknownTranslationDebits(env); }
     catch (cause) { console.error("Unknown debit reconciliation failed", cause); }
+    try { await retryPendingStripeGrants(env); }
+    catch (cause) { console.error("Stripe purchase reconciliation failed", cause); }
   }
 };
